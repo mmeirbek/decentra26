@@ -7,8 +7,10 @@ only while Soup trains (trainer.py); then the tied embedding / output head is st
 values came from an fp16 checkpoint, so nothing changes) and restored afterwards.
 
 `fused_forward` replaces Qwen2ForCausalLM.forward for training steps with labels:
-  - pad positions are dropped right away (`rowmap` = flat indices of the real tokens); SDPA still
-    sees the padded batch with the mask transformers builds, so attention is unchanged;
+  - pad positions are dropped right away (`rowmap` = flat indices of the real tokens); attention
+    runs causally over each row's own tokens (blocks.attend), which is the base's padded attention
+    with its mask without the pad positions; a mask that is not one contiguous run per row falls
+    back to the padded call with the mask transformers builds;
   - the LoRA dropout masks come from torch's own dropout run on a tensor of the base run's shape,
     dtype and order (q then v, layer by layer), so they are the masks the base run draws;
   - the output carries the loss and no logits. Entropy, accuracy and each token's loss are left in
@@ -21,8 +23,8 @@ from .blocks import AttnPrologue, FinalNorm, LayerPlan, PostBlock, StepState, at
 from .kernels_loss import IGNORE_INDEX, FusedLMLoss, loss_scale_of
 from . import warmup
 
-RECOMPUTE_MLP = True  # keep only the MLP input and redo gate|up in backward: on the T4, -1.2 GB
-                      # at the peak for about 3% of the speed
+RECOMPUTE_MLP = True  # keep no MLP activations and redo gate|up in backward: on a T4 about -1.1 GB
+                      # at the peak for about 10-13% more time per step
 
 
 class TokenStats:
