@@ -51,7 +51,7 @@ def code(*lines):
             "source": [line + "\n" for line in lines]}
 
 
-def notebook(archive, repeats, profile, only_solution=False):
+def notebook(archive, repeats, profile, only_solution=False, tune=False):
     template = json.loads((REPO / "templates" / "kaggle_notebook.ipynb").read_text())
     install = [c for c in template["cells"] if c["cell_type"] == "code"][1]  # GPU check + pip
     run_args = f"--repeats {repeats}" + (" --profile" if profile else "") + \
@@ -79,6 +79,8 @@ def notebook(archive, repeats, profile, only_solution=False):
              "    print('PROBE efficient attention with enable_gqa: NOT supported', repr(exc)[:200])"),
         code("!cd /kaggle/working/repo && python task/prepare_data.py",
              "!cd /kaggle/working/repo && python -m pytest solution -q 2>&1 | tail -15"),
+        code("!cd /kaggle/working/repo && python -m solution._tune 2>&1 | tail -150" if tune
+             else "print('no tuning in this run')"),
         code(f"!cd /kaggle/working/repo && python harness/run_task.py {run_args}"),
         code("!cd /kaggle/working/repo && python harness/check_rules.py",
              "!cd /kaggle/working/repo && python harness/score.py runs/result.json"),
@@ -118,6 +120,8 @@ def main():
                         help="experiment: run with model.RECOMPUTE_MLP = False")
     parser.add_argument("--only-solution", action="store_true",
                         help="train only the solution (quicker; the checks that need the base fail)")
+    parser.add_argument("--tune", action="store_true",
+                        help="experiment: time kernel block sizes on the T4 (dev/tune_probe.py)")
     parser.add_argument("--probe-first-step", action="store_true",
                         help="experiment: time the first training steps (dev/first_step_probe.py)")
     parser.add_argument("--out", default=str(REPO / "runs_kaggle" / "build"))
@@ -132,9 +136,12 @@ def main():
         extra.append(("solution/_probe.py", REPO / "dev" / "first_step_probe.py"))
         replace.append(("solution/__init__.py", "    patch_soup_wrapper()\n",
                         "    patch_soup_wrapper()\n    from . import _probe\n    _probe.install()\n"))
+    if args.tune:
+        extra.append(("solution/_tune.py", REPO / "dev" / "tune_probe.py"))
     (out / "notebook.ipynb").write_text(json.dumps(notebook(solution_archive(replace, extra),
                                                             args.repeats, args.profile,
-                                                            args.only_solution), indent=1))
+                                                            args.only_solution, args.tune),
+                                                   indent=1))
     meta = {"id": f"{args.user}/{args.slug}", "title": args.slug, "code_file": "notebook.ipynb",
             "language": "python", "kernel_type": "notebook", "is_private": True,
             "enable_gpu": True, "enable_internet": True, "dataset_sources": [],

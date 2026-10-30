@@ -7,15 +7,62 @@ optimizer), each between two CUDA synchronizations, and the time of the first la
 kernel of ours in the main thread.
 """
 
+import atexit
+import os
 import time
 
 import torch
+
+
+def age():
+    """Seconds since this process started (Linux /proc), the clock the harness's wall time uses."""
+    try:
+        with open("/proc/self/stat") as f:
+            start_ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+        return uptime - start_ticks / os.sysconf("SC_CLK_TCK")
+    except OSError:
+        return float("nan")
+
+
+def mark(what):
+    print(f"[probe] t={age():6.2f} s  {what}", flush=True)
 
 
 def install():
     import transformers
 
     from . import model
+    from soup_cli.trainer.sft import SFTTrainerWrapper
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
+
+    mark("apply() done")
+    atexit.register(mark, "interpreter exit")
+
+    def around(owner, name, label):
+        original = getattr(owner, name)
+
+        def wrapped(*args, **kwargs):
+            mark(f"{label} start")
+            try:
+                return original(*args, **kwargs)
+            finally:
+                mark(f"{label} end")
+
+        setattr(owner, name, wrapped)
+
+    around(SFTTrainerWrapper, "_setup_transformers", "model load + LoRA")
+    around(SFTTrainerWrapper, "train", "Soup train()")
+    around(transformers.Trainer, "train", "HF Trainer.train()")
+    around(transformers.Trainer, "save_model", "save_model")
+    original_init = Qwen2ForCausalLM.__init__
+
+    def init(self, *args, **kwargs):
+        mark("Qwen2ForCausalLM built (weights load next)")
+        original_init(self, *args, **kwargs)
+
+    Qwen2ForCausalLM.__init__ = init
 
     calls = {"forward": 0, "step": 0}
     original_forward = model.fused_forward
