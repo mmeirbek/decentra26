@@ -97,17 +97,24 @@ def test_add_rmsnorm_forward_and_backward(with_lora):
     h = torch.empty_like(res)
     rstd = torch.empty(tokens, device=DEV)
     x = torch.empty(tokens, hidden, dtype=torch.float16, device=DEV)
-    xq, xv = torch.empty_like(x), torch.empty_like(x)
-    add_rmsnorm_fwd_kernel[(tokens,)](res, delta, w, h, rstd, x, rowmap, keep_q_pad, keep_v_pad,
-                                      drop_scale, xq, xv, eps, H=hidden, BLOCK=2048,
-                                      WITH_LORA=with_lora, num_warps=8)
+    xhat, xq, xv = torch.empty_like(x), torch.empty_like(x), torch.empty_like(x)
+    bits_q = torch.empty(tokens, hidden // 8, dtype=torch.uint8, device=DEV)
+    bits_v = torch.empty_like(bits_q)
+    add_rmsnorm_fwd_kernel[(tokens,)](res, delta, w, h, rstd, x, xhat, rowmap, keep_q_pad,
+                                      keep_v_pad, drop_scale, xq, xv, bits_q, bits_v, eps,
+                                      H=hidden, BLOCK=2048, WITH_LORA=with_lora, num_warps=8)
     res_r = res.clone().requires_grad_()
     h_ref, y, yq, yv = _norm_reference(res_r, delta, w, eps, kq, kv, drop_scale)
     close(h, h_ref, 1e-6)
     close(x, y.half(), 1e-3)
+    close(xhat, (y / w).half(), 1e-3)
     if with_lora:
         close(xq, yq.half(), 1e-3)
         close(xv, yv.half(), 1e-3)
+        weights = 2 ** torch.arange(8, device=DEV)
+        unpack = lambda b: ((b.long()[:, :, None] // weights) % 2).reshape(tokens, hidden).bool()
+        assert torch.equal(unpack(bits_q), keep_q_pad[rowmap])
+        assert torch.equal(unpack(bits_v), keep_v_pad[rowmap])
 
     dx = torch.randn(tokens, hidden, device=DEV).half()
     dxq = torch.randn(tokens, hidden, device=DEV).half()
@@ -115,15 +122,15 @@ def test_add_rmsnorm_forward_and_backward(with_lora):
     dres_out = torch.randn(tokens, hidden, device=DEV)
     dres = torch.empty_like(res)
     ddelta = torch.empty_like(x)
-    add_rmsnorm_bwd_kernel[(tokens,)](dx, h, rstd, w, dres_out, dres, ddelta, rowmap, keep_q_pad,
-                                      keep_v_pad, drop_scale, dxq, dxv, H=hidden, BLOCK=2048,
+    add_rmsnorm_bwd_kernel[(tokens,)](dx, xhat, rstd, w, dres_out, dres, ddelta, bits_q, bits_v,
+                                      drop_scale, dxq, dxv, H=hidden, BLOCK=2048,
                                       WITH_LORA=with_lora, num_warps=8)
     upstream = (y * dx.float()).sum() + (h_ref * dres_out).sum()
     if with_lora:
         upstream = upstream + (yq * dxq.float()).sum() + (yv * dxv.float()).sum()
     upstream.backward()
-    close(dres, res_r.grad, 1e-4)
-    close(ddelta, res_r.grad.half(), 1e-3)
+    close(dres, res_r.grad, 2e-3)  # xhat is kept in fp16
+    close(ddelta, res_r.grad.half(), 2e-3)
 
 
 def _rope(x, cos, sin):

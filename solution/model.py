@@ -199,9 +199,7 @@ def fused_forward(model, plan, input_ids, attention_mask, labels, num_items_in_b
         mask = modeling_qwen2.create_causal_mask(config=model.config, inputs_embeds=like,
                                                  attention_mask=attention_mask,
                                                  past_key_values=None, position_ids=position_ids)
-    step = StepState(rowmap, batch, seq_len, cos[0].contiguous(), sin[0].contiguous(),
-                     torch.ones(1, dtype=torch.bool, device=dev),
-                     torch.ones(1, dtype=torch.float32, device=dev), segments)
+    step = StepState(rowmap, batch, seq_len, cos[0].contiguous(), sin[0].contiguous(), segments)
 
     delta = torch.zeros((tokens, hidden), dtype=torch.float16, device=dev)
     ones = plan.dropout_input((batch, seq_len, hidden), dev)

@@ -68,14 +68,13 @@ def _compile_all(config):
                                   1024, BLOCK=WORDS_PER_PROGRAM, num_warps=4,
                                   enable_fp_fusion=False, grid=grid)
         for with_lora in (True, False):
-            add_rmsnorm_fwd_kernel.warmup(t(f32), t(f16), t(f32), t(f32), t(f32), t(f16), t(i64),
-                                          t(torch.bool), t(torch.bool), t(f32), t(f16), t(f16),
-                                          1e-6, H=hidden, BLOCK=block, WITH_LORA=with_lora,
-                                          num_warps=8, grid=grid)
-            add_rmsnorm_bwd_kernel.warmup(t(f16), t(f32), t(f32), t(f32), t(f32), t(f32), t(f16),
+            add_rmsnorm_fwd_kernel.warmup(t(f32), t(f16), t(f32), t(f32), t(f32), t(f16), t(f16),
                                           t(i64), t(torch.bool), t(torch.bool), t(f32), t(f16),
-                                          t(f16), H=hidden, BLOCK=block, WITH_LORA=with_lora,
-                                          num_warps=8, grid=grid)
+                                          t(f16), t(u8), t(u8), 1e-6, H=hidden, BLOCK=block,
+                                          WITH_LORA=with_lora, num_warps=8, grid=grid)
+            add_rmsnorm_bwd_kernel.warmup(t(f16), t(f16), t(f32), t(f32), t(f32), t(f32), t(f16),
+                                          t(u8), t(u8), t(f32), t(f16), t(f16), H=hidden,
+                                          BLOCK=block, WITH_LORA=with_lora, num_warps=8, grid=grid)
         for kernel in (qkv_rope_fwd_kernel, qkv_rope_bwd_kernel):
             kernel.warmup(t(f16), t(f16), t(f16), t(f32), t(f32), t(i64), t(f16), t(f16), t(f16),
                           2.0, 2.0, 512, NQ=n_q, NKV=n_kv, D=head_dim, num_warps=1, grid=grid)
