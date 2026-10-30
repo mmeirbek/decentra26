@@ -62,6 +62,17 @@ def notebook(archive, repeats, profile):
              f"ARCHIVE = '{archive}'",
              "tarfile.open(fileobj=io.BytesIO(base64.b64decode(ARCHIVE))).extractall('/kaggle/working/repo')",
              "print(sorted(p.name for p in __import__('pathlib').Path('/kaggle/working/repo/solution').iterdir()))"),
+        code("import torch, torch.nn.functional as F",
+             "from torch.nn.attention import SDPBackend, sdpa_kernel",
+             "q = torch.randn(1, 12, 300, 128, device='cuda', dtype=torch.float16, requires_grad=True)",
+             "k = torch.randn(1, 2, 300, 128, device='cuda', dtype=torch.float16, requires_grad=True)",
+             "v = torch.randn(1, 2, 300, 128, device='cuda', dtype=torch.float16, requires_grad=True)",
+             "try:",
+             "    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):",
+             "        F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True).sum().backward()",
+             "    print('PROBE efficient attention with enable_gqa: supported')",
+             "except Exception as exc:",
+             "    print('PROBE efficient attention with enable_gqa: NOT supported', repr(exc)[:200])"),
         code("!cd /kaggle/working/repo && python task/prepare_data.py",
              "!cd /kaggle/working/repo && python -m pytest solution -q 2>&1 | tail -15"),
         code(f"!cd /kaggle/working/repo && python harness/run_task.py {run_args}"),
@@ -99,15 +110,15 @@ def main():
     parser.add_argument("--slug", default="soup-kernel-dev")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--recompute-mlp", action="store_true",
-                        help="experiment: run with model.RECOMPUTE_MLP = True")
+    parser.add_argument("--no-recompute-mlp", action="store_true",
+                        help="experiment: run with model.RECOMPUTE_MLP = False")
     parser.add_argument("--out", default=str(REPO / "runs_kaggle" / "build"))
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     replace = []
-    if args.recompute_mlp:
-        replace.append(("solution/model.py", "RECOMPUTE_MLP = False", "RECOMPUTE_MLP = True"))
+    if args.no_recompute_mlp:
+        replace.append(("solution/model.py", "RECOMPUTE_MLP = True", "RECOMPUTE_MLP = False"))
     (out / "notebook.ipynb").write_text(json.dumps(notebook(solution_archive(replace),
                                                             args.repeats, args.profile), indent=1))
     meta = {"id": f"{args.user}/{args.slug}", "title": args.slug, "code_file": "notebook.ipynb",

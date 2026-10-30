@@ -21,7 +21,8 @@ from .blocks import AttnPrologue, FinalNorm, LayerPlan, PostBlock, StepState, at
 from .kernels_loss import IGNORE_INDEX, FusedLMLoss, loss_scale_of
 from . import warmup
 
-RECOMPUTE_MLP = False  # True: keep only the MLP input and redo gate|up in backward (less memory)
+RECOMPUTE_MLP = True  # keep only the MLP input and redo gate|up in backward: on the T4, -1.2 GB
+                      # at the peak for about 3% of the speed
 
 
 class TokenStats:
