@@ -18,6 +18,7 @@ from .kernels_attn import qkv_rope_bwd_kernel, qkv_rope_fwd_kernel
 from .kernels_mlp import gated_act_kernel
 from .kernels_nf4 import NF4Group, dequant_group
 from .kernels_norm import add_rmsnorm_bwd_kernel, add_rmsnorm_fwd_kernel, lora_inputs_kernel
+from . import warmup
 
 ACT_BLOCK, ACT_WARPS = 1024, 8  # fastest on a T4 (one block size: one compiled variant)
 HALF = torch.float16
@@ -157,6 +158,7 @@ def _norm_launch(res, delta, weight, eps, step, keep_q=None, keep_v=None, drop_s
 
 def _norm_backward(dx, xhat, rstd, weight, dres_out, step, bits_q=None, bits_v=None,
                    drop_scale=None, dxq=None, dxv=None):
+    warmup.wait(backward=True)  # the first backward kernel of a step (FinalNorm's)
     tokens, hidden = xhat.shape
     dres = _rows(tokens, hidden, dtype=torch.float32, device=xhat.device)
     ddelta = _rows(tokens, hidden, device=xhat.device)

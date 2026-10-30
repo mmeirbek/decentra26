@@ -6,9 +6,10 @@ from its config first and then spends most of its time reading and quantizing th
 compiles start in a background thread of this same process as soon as the module exists, with the
 sizes from that config (model.patch_qwen2 calls `start`). Each compiled kernel is also made ready to
 launch there: Triton builds a small C launcher for it and loads the binary on its first launch,
-about 0.3 s per kernel on Kaggle that would otherwise fall into the first training step. The first
-fused forward waits for the thread. Nothing here launches a kernel on the GPU (`warmup=True`
-compiles only), nothing is read from disk, and nothing is cached across runs.
+about 0.3 s per kernel on Kaggle that would otherwise fall into the first training step. The
+kernels compile in the order of their first use: the first fused forward waits for the forward
+ones only, the first backward for the rest. Nothing here launches a kernel on the GPU
+(`warmup=True` compiles only), nothing is read from disk, and nothing is cached across runs.
 """
 
 import threading
@@ -17,7 +18,8 @@ import time
 import torch
 
 _thread = None
-_waited = False
+_forward_ready = threading.Event()  # set once the kernels the forward pass launches are ready
+_waited = {"forward": False, "backward": False}
 
 
 def start(config):
@@ -32,14 +34,18 @@ def start(config):
     _thread.start()
 
 
-def wait():
-    global _waited
-    if _thread is None or _waited:
+def wait(backward=False):
+    """Block until the kernels of the forward pass (or, with `backward`, all of them) are ready."""
+    which = "backward" if backward else "forward"
+    if _thread is None or _waited[which]:
         return
     started = time.perf_counter()
-    _thread.join()
-    _waited = True
-    print(f"[solution] first fused step waited {time.perf_counter() - started:.1f} s for the "
+    if backward:
+        _thread.join()
+    else:
+        _forward_ready.wait()
+    _waited[which] = True
+    print(f"[solution] first fused {which} waited {time.perf_counter() - started:.2f} s for the "
           "background compile", flush=True)
 
 
@@ -79,20 +85,27 @@ def _compile_all(config):
             t(f32), t(f16), t(f32), t(f32), t(f32), t(f16), t(f16), t(i64), t(torch.bool),
             t(torch.bool), t(f32), t(f16), t(f16), t(u8), t(u8), 1e-6, 0, H=hidden, BLOCK=block,
             num_warps=8, grid=grid))
+
+        def rope(kernel):
+            ready(kernel.warmup(t(f16), t(f16), t(f16), t(f32), t(f32), t(i64), t(f16), t(f16),
+                                t(f16), 2.0, 2.0, 512, NQ=n_q, NKV=n_kv, D=head_dim, num_warps=1,
+                                grid=grid))
+
+        rope(qkv_rope_fwd_kernel)
+        ready(gated_act_kernel.warmup(t(f16), t(f16), 0, I=config.intermediate_size,
+                                      BLOCK=ACT_BLOCK, num_warps=ACT_WARPS, grid=grid))
+        ready(lm_loss_kernel.warmup(t(f16), t(i64), t(f32), t(f32), t(f32), t(torch.int32), vocab,
+                                    0, V=vocab, BLOCK=VOCAB_BLOCK, num_warps=8, grid=grid))
+        _forward_ready.set()
         ready(add_rmsnorm_bwd_kernel.warmup(
             t(f16), t(f16), t(f32), t(f32), t(f32), t(f32), t(f16), t(u8), t(u8), t(f32), t(f16),
             t(f16), 0, H=hidden, BLOCK=block, num_warps=8, grid=grid))
         ready(lora_inputs_kernel.warmup(t(f16), t(f32), t(u8), t(u8), t(f32), t(f16), t(f16),
                                         H=hidden, BLOCK=block, num_warps=8, grid=grid))
-        for kernel in (qkv_rope_fwd_kernel, qkv_rope_bwd_kernel):
-            ready(kernel.warmup(t(f16), t(f16), t(f16), t(f32), t(f32), t(i64), t(f16), t(f16),
-                                t(f16), 2.0, 2.0, 512, NQ=n_q, NKV=n_kv, D=head_dim, num_warps=1,
-                                grid=grid))
-        ready(gated_act_kernel.warmup(t(f16), t(f16), 0, I=config.intermediate_size,
-                                      BLOCK=ACT_BLOCK, num_warps=ACT_WARPS, grid=grid))
-        ready(lm_loss_kernel.warmup(t(f16), t(i64), t(f32), t(f32), t(f32), t(torch.int32), vocab,
-                                    0, V=vocab, BLOCK=VOCAB_BLOCK, num_warps=8, grid=grid))
+        rope(qkv_rope_bwd_kernel)
         print(f"[solution] background compile of 8 kernel variants took "
               f"{time.perf_counter() - started:.1f} s", flush=True)
     except Exception as exc:  # noqa: BLE001 - a failed warm-up only means compiling at first use
         print(f"[solution] background compile skipped: {exc!r}", flush=True)
+    finally:
+        _forward_ready.set()
