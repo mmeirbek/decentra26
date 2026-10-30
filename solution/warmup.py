@@ -71,8 +71,9 @@ def _compile_all(config):
         head_dim = getattr(config, "head_dim", None) or hidden // n_q
         block = triton.next_power_of_2(hidden)
         grid = (1,)
-        ready(nf4_dequant_kernel.warmup(t(torch.int32), t(u8), t(f32), t(f32), t(f32), t(f32),
-                                        t(f16), 1024, BLOCK=WORDS_PER_PROGRAM, num_warps=NF4_WARPS,
+        ready(nf4_dequant_kernel.warmup(t(torch.int32), t(u8), t(f32), t(f32), t(f32), t(f16),
+                                        t(torch.int32), t(i64), t(i64), t(i64), t(f32),
+                                        BLOCK=WORDS_PER_PROGRAM, num_warps=NF4_WARPS,
                                         enable_fp_fusion=False, grid=grid))
         for with_lora in (True, False):
             ready(add_rmsnorm_fwd_kernel.warmup(

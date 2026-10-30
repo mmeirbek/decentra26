@@ -22,7 +22,7 @@ from solution import kernels_loss  # noqa: E402
 from solution.blocks import ACT_BLOCK_BWD, ACT_BLOCK_FWD, ACT_WARPS  # noqa: E402
 from solution.kernels_attn import qkv_rope_bwd_kernel, qkv_rope_fwd_kernel  # noqa: E402
 from solution.kernels_mlp import gated_act_kernel  # noqa: E402
-from solution.kernels_nf4 import NF4Weight  # noqa: E402
+from solution.kernels_nf4 import NF4Group  # noqa: E402
 from solution.kernels_norm import add_rmsnorm_bwd_kernel, add_rmsnorm_fwd_kernel  # noqa: E402
 
 
@@ -30,17 +30,26 @@ def close(a, b, tol):
     torch.testing.assert_close(a.float(), b.float(), rtol=tol, atol=tol)
 
 
-@pytest.mark.parametrize("shape", [(320, 128), (256, 1536)])
-def test_nf4_dequant_is_bitsandbytes_bit_for_bit(shape):
+@pytest.mark.parametrize("shapes", [[(256, 128)], [(512, 1536), (256, 1536), (256, 1536)]])
+@pytest.mark.parametrize("share", [False, True])
+def test_nf4_dequant_is_bitsandbytes_bit_for_bit(shapes, share):
     import bitsandbytes.functional as bnbf
 
     torch.manual_seed(0)
-    w = torch.randn(shape, dtype=torch.float16, device=DEV) * 0.05
-    packed, qs = bnbf.quantize_4bit(w, blocksize=64, compress_statistics=True, quant_type="nf4")
-    ref = bnbf.dequantize_4bit(packed, qs)
-    ours = NF4Weight(SimpleNamespace(data=packed, quant_state=qs)).dequant()
+    params, refs = [], []
+    for shape in shapes:
+        w = torch.randn(shape, dtype=torch.float16, device=DEV) * 0.05
+        packed, qs = bnbf.quantize_4bit(w, blocksize=64, compress_statistics=True,
+                                        quant_type="nf4")
+        params.append(SimpleNamespace(data=packed, quant_state=qs))
+        refs.append(bnbf.dequantize_4bit(packed, qs))
+    group = NF4Group(params, share=share)
+    ours = group.dequant()
+    ref = torch.cat(refs)
     assert ours.dtype == ref.dtype and ours.shape == ref.shape
     assert torch.equal(ours, ref)
+    for p, r in zip(params, refs):  # bitsandbytes still reads the (now shared) storage right
+        assert torch.equal(bnbf.dequantize_4bit(p.data, p.quant_state), r)
 
 
 @pytest.mark.parametrize("chunk", [16, 512])

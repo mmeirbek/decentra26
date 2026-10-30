@@ -76,7 +76,7 @@ class ModelPlan:
         if weight.dtype != torch.float16:
             self._embed_dtype = weight.dtype
             weight.data = weight.data.to(torch.float16)
-        largest = max(sum(w.numel for w in group) for lp in self.layers
+        largest = max(group.numel for lp in self.layers
                       for group in (lp.qkv, lp.o, lp.gate_up, lp.down))
         self.workspace = torch.empty(largest, dtype=torch.float16, device=weight.device)
         self.active = True

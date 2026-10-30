@@ -22,73 +22,115 @@ WEIGHTS_PER_SCALE = 64
 SCALES_PER_SCALE2 = 256
 
 
-@triton.jit(do_not_specialize=["n_words"])
-def nf4_dequant_kernel(words_ptr, scale_q_ptr, scale2_ptr, scale_code_ptr, offset_ptr, nf4_ptr,
-                       out_ptr, n_words, BLOCK: tl.constexpr):
+@triton.jit
+def nf4_dequant_kernel(words_ptr, scale_q_ptr, scale2_ptr, scale_code_ptr, nf4_ptr, out_ptr,
+                       prog_weight_ptr, word_start_ptr, scale_q_start_ptr, scale2_start_ptr,
+                       offset_ptr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    word_idx = pid * BLOCK + tl.arange(0, BLOCK)
-    live = word_idx < n_words
-    word = tl.load(words_ptr + word_idx, mask=live, other=0)
-    group = word_idx // 8  # 64 weights = 8 words share one scale
-    scale_q = tl.load(scale_q_ptr + group, mask=live, other=0).to(tl.int32)
-    scale = tl.load(scale_code_ptr + scale_q, mask=live, other=0.0) * \
-        tl.load(scale2_ptr + group // 256, mask=live, other=0.0)
-    scale = scale + tl.load(offset_ptr)
+    # The weights of a group sit back to back; each program stays inside one of them.
+    w = tl.load(prog_weight_ptr + pid)
+    word_idx = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    word = tl.load(words_ptr + word_idx)
+    group = (word_idx - tl.load(word_start_ptr + w)) // 8  # 64 weights = 8 words share one scale
+    scale_q = tl.load(scale_q_ptr + tl.load(scale_q_start_ptr + w) + group).to(tl.int32)
+    scale = tl.load(scale_code_ptr + scale_q) * \
+        tl.load(scale2_ptr + tl.load(scale2_start_ptr + w) + group // 256)
+    scale = scale + tl.load(offset_ptr + w)
     # Weight k of a little-endian word sits in byte k // 2, high nibble first.
     k = tl.arange(0, 8)
     shift = (k // 2) * 8 + (1 - k % 2) * 4
     code = (word[:, None] >> shift[None, :]) & 15
     weights = tl.load(nf4_ptr + code) * scale[:, None]
-    out_offs = word_idx.to(tl.int64)[:, None] * 8 + k[None, :]
-    tl.store(out_ptr + out_offs, weights.to(out_ptr.dtype.element_ty), mask=live[:, None])
+    tl.store(out_ptr + word_idx[:, None] * 8 + k[None, :], weights.to(out_ptr.dtype.element_ty))
 
 
-class NF4Weight:
-    """The tensors of one bitsandbytes Params4bit that the kernel reads, looked up once."""
+def _check(param):
+    qs = param.quant_state
+    if qs.quant_type != "nf4" or not qs.nested or qs.blocksize != WEIGHTS_PER_SCALE \
+            or qs.state2.blocksize != SCALES_PER_SCALE2 or param.data.dtype != torch.uint8:
+        raise ValueError("needs NF4 weights with nested 8-bit scales and blocksize 64")
+    rows, cols = qs.shape
+    if (rows * cols) % (8 * WORDS_PER_PROGRAM):
+        raise ValueError("weight size is not a whole number of dequant programs")
+    return qs
 
-    def __init__(self, param):
-        qs = param.quant_state
-        if qs.quant_type != "nf4" or not qs.nested or qs.blocksize != WEIGHTS_PER_SCALE \
-                or qs.state2.blocksize != SCALES_PER_SCALE2 or param.data.dtype != torch.uint8:
-            raise ValueError("needs NF4 weights with nested 8-bit scales and blocksize 64")
-        self.shape = tuple(qs.shape)
-        self.numel = self.shape[0] * self.shape[1]
-        if self.numel % 8:
-            raise ValueError("needs whole 32-bit words of packed codes")
-        self.words = param.data.view(-1).view(torch.int32)
-        self.scale_q = qs.absmax
-        self.scale2 = qs.state2.absmax
-        self.scale_code = qs.state2.code
-        self.offset = qs.offset if torch.is_tensor(qs.offset) else \
-            torch.tensor(float(qs.offset), dtype=torch.float32, device=self.words.device)
-        self.nf4 = qs.code
-        self.dtype = qs.dtype
+
+class NF4Group:
+    """bitsandbytes Params4bit weights with the same in_features, dequantized by one launch into
+    one (sum of out_features, in_features) tensor, so one matmul serves them all (q|k|v, gate|up).
+
+    With `share=True` the packed codes and the 8-bit scales of the group are moved into one
+    buffer each and every Params4bit (and its quant state) is pointed at its slice of them:
+    the same values, no second copy, and bitsandbytes reads them as before."""
+
+    def __init__(self, params, share=False):
+        states = [_check(p) for p in params]
+        cols = states[0].shape[1]
+        if any(qs.shape[1] != cols or qs.dtype != states[0].dtype for qs in states):
+            raise ValueError("a group needs one in_features and one dtype")
+        if any(not torch.equal(qs.code, states[0].code)
+               or not torch.equal(qs.state2.code, states[0].state2.code) for qs in states[1:]):
+            raise ValueError("a group needs one NF4 table and one scale code book")
+        dev = params[0].data.device
+        self.shape = (sum(qs.shape[0] for qs in states), cols)
+        self.numel = self.shape[0] * cols
+        self.dtype = states[0].dtype
+        self.nf4, self.scale_code = states[0].code, states[0].state2.code
+        words = [p.data.view(-1).view(torch.int32) for p in params]
+        scale_q = [qs.absmax for qs in states]
+        scale2 = [qs.state2.absmax for qs in states]
+        if share and len(params) > 1:
+            words, scale_q, scale2 = (self._share(parts) for parts in (words, scale_q, scale2))
+            for p, qs, wv, sq, s2 in zip(params, states, words, scale_q, scale2):
+                p.data = wv.view(torch.uint8).view(p.data.shape)
+                qs.absmax, qs.state2.absmax = sq, s2
+        self.words = torch.cat(words) if len(words) > 1 else words[0]
+        self.scale_q = torch.cat(scale_q) if len(scale_q) > 1 else scale_q[0]
+        self.scale2 = torch.cat(scale2) if len(scale2) > 1 else scale2[0]
+        offsets = [float(qs.offset) for qs in states]
+
+        def starts(parts):
+            out, at = [], 0
+            for part in parts:
+                out.append(at)
+                at += part.numel()
+            return out
+
+        programs = [n.numel() // WORDS_PER_PROGRAM for n in words]
+        self.prog_weight = torch.repeat_interleave(torch.arange(len(params), dtype=torch.int32),
+                                                   torch.tensor(programs)).to(dev)
+        self.word_start = torch.tensor(starts(words), dtype=torch.int64, device=dev)
+        self.scale_q_start = torch.tensor(starts(scale_q), dtype=torch.int64, device=dev)
+        self.scale2_start = torch.tensor(starts(scale2), dtype=torch.int64, device=dev)
+        self.offset = torch.tensor(offsets, dtype=torch.float32, device=dev)
+        self.programs = sum(programs)
+
+    @staticmethod
+    def _share(parts):
+        """One buffer holding `parts` back to back, and views of it in their place."""
+        whole = torch.cat([t.reshape(-1) for t in parts])
+        views, at = [], 0
+        for t in parts:
+            views.append(whole[at:at + t.numel()].view(t.shape))
+            at += t.numel()
+        return views
 
     def dequant(self, out=None):
-        """The weight as a dense (out_features, in_features) tensor in the compute dtype."""
+        """The weights as one dense (sum of out_features, in_features) tensor in compute dtype."""
         if out is None:
             out = torch.empty(self.shape, dtype=self.dtype, device=self.words.device)
-        n_words = self.numel // 8
-        grid = (triton.cdiv(n_words, WORDS_PER_PROGRAM),)
-        nf4_dequant_kernel[grid](self.words, self.scale_q, self.scale2, self.scale_code,
-                                 self.offset, self.nf4, out, n_words, BLOCK=WORDS_PER_PROGRAM,
-                                 num_warps=NF4_WARPS, enable_fp_fusion=False)
+        nf4_dequant_kernel[(self.programs,)](
+            self.words, self.scale_q, self.scale2, self.scale_code, self.nf4, out,
+            self.prog_weight, self.word_start, self.scale_q_start, self.scale2_start, self.offset,
+            BLOCK=WORDS_PER_PROGRAM, num_warps=NF4_WARPS, enable_fp_fusion=False)
         return out
 
 
-def dequant_rows(weights, dtype, device, workspace=None):
-    """Several weights with the same in_features, stacked by rows into one dense tensor (one
-    matmul then serves all of them). With `workspace`, the result is a view of it: every dequant
-    of a step writes the same buffer, which the matmul reading it has finished with by then (one
-    CUDA stream), so the allocator never sees these 5-55 MB temporaries."""
-    rows = sum(w.shape[0] for w in weights)
-    cols = weights[0].shape[1]
-    if workspace is not None:
-        out = workspace[:rows * cols].view(rows, cols)
-    else:
-        out = torch.empty((rows, cols), dtype=dtype, device=device)
-    start = 0
-    for w in weights:
-        w.dequant(out[start:start + w.shape[0]])
-        start += w.shape[0]
-    return out
+def dequant_group(group, workspace=None):
+    """`group.dequant()` into a view of `workspace` when given: every dequant of a step writes
+    the same buffer, which the matmul reading it has finished with by then (one CUDA stream), so
+    the allocator never sees these 5-55 MB temporaries."""
+    if workspace is None:
+        return group.dequant()
+    rows, cols = group.shape
+    return group.dequant(workspace[:rows * cols].view(rows, cols))
