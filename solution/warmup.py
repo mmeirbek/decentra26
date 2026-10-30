@@ -48,7 +48,7 @@ def _compile_all(config):
     from .kernels_attn import qkv_rope_bwd_kernel, qkv_rope_fwd_kernel
     from .kernels_loss import VOCAB_BLOCK, lm_loss_kernel
     from .kernels_mlp import gated_act_kernel
-    from .kernels_nf4 import BYTES_PER_PROGRAM, nf4_dequant_kernel
+    from .kernels_nf4 import WORDS_PER_PROGRAM, nf4_dequant_kernel
     from .kernels_norm import add_rmsnorm_bwd_kernel, add_rmsnorm_fwd_kernel
 
     started = time.perf_counter()
@@ -64,9 +64,9 @@ def _compile_all(config):
         head_dim = getattr(config, "head_dim", None) or hidden // n_q
         block = triton.next_power_of_2(hidden)
         grid = (1,)
-        nf4_dequant_kernel.warmup(t(u8), t(u8), t(f32), t(f32), t(f32), t(f32), t(f16), 1024,
-                                  BLOCK=BYTES_PER_PROGRAM, num_warps=4, enable_fp_fusion=False,
-                                  grid=grid)
+        nf4_dequant_kernel.warmup(t(torch.int32), t(u8), t(f32), t(f32), t(f32), t(f32), t(f16),
+                                  1024, BLOCK=WORDS_PER_PROGRAM, num_warps=4,
+                                  enable_fp_fusion=False, grid=grid)
         for with_lora in (True, False):
             add_rmsnorm_fwd_kernel.warmup(t(f32), t(f16), t(f32), t(f32), t(f32), t(f16), t(i64),
                                           t(torch.bool), t(torch.bool), t(f32), t(f16), t(f16),

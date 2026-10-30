@@ -149,9 +149,9 @@ def test_qkv_rope_forward_and_backward():
     cos = torch.cat([ang.cos(), ang.cos()], -1).contiguous()
     sin = torch.cat([ang.sin(), ang.sin()], -1).contiguous()
     sq, sv = 2.0, 1.5
-    q = torch.zeros(batch * seq, nq, d, dtype=torch.float16, device=DEV)
-    k = torch.zeros(batch * seq, nkv, d, dtype=torch.float16, device=DEV)
-    v = torch.zeros_like(k)
+    q = torch.empty(tokens, nq, d, dtype=torch.float16, device=DEV)
+    k = torch.empty(tokens, nkv, d, dtype=torch.float16, device=DEV)
+    v = torch.empty_like(k)
     qkv_rope_fwd_kernel[(tokens, nq + 2 * nkv)](qkv, lq, lv, cos, sin, rowmap, q, k, v, sq, sv,
                                                  seq, NQ=nq, NKV=nkv, D=d, num_warps=1)
 
@@ -165,10 +165,9 @@ def test_qkv_rope_forward_and_backward():
     v_ref = base[:, (nq + nkv) * d:].view(tokens, nkv, d) + \
         (lv_r * sv).half().float().view(tokens, nkv, d)
     q_ref, k_ref = _rope(q_ref, c, s), _rope(k_ref, c, s)
-    close(q[rowmap], q_ref.half(), 2e-3)
-    close(k[rowmap], k_ref.half(), 2e-3)
-    close(v[rowmap], v_ref.half(), 2e-3)
-    assert not q[~mask.reshape(-1)].any()
+    close(q, q_ref.half(), 2e-3)
+    close(k, k_ref.half(), 2e-3)
+    close(v, v_ref.half(), 2e-3)
 
     dq = torch.randn_like(q)
     dk = torch.randn_like(k)
@@ -177,8 +176,7 @@ def test_qkv_rope_forward_and_backward():
     dlq, dlv = torch.empty_like(lq), torch.empty_like(lv)
     qkv_rope_bwd_kernel[(tokens, nq + 2 * nkv)](dq, dk, dv, cos, sin, rowmap, dqkv, dlq, dlv, sq,
                                                  sv, seq, NQ=nq, NKV=nkv, D=d, num_warps=1)
-    ((q_ref * dq[rowmap].float()).sum() + (k_ref * dk[rowmap].float()).sum()
-     + (v_ref * dv[rowmap].float()).sum()).backward()
+    ((q_ref * dq.float()).sum() + (k_ref * dk.float()).sum() + (v_ref * dv.float()).sum()).backward()
     close(dqkv, base.grad, 2e-3)
     close(dlq, (base.grad[:, :nq * d].half().float() * sq), 2e-3)
     close(dlv, (base.grad[:, (nq + nkv) * d:].half().float() * sv), 2e-3)

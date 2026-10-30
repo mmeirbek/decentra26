@@ -17,7 +17,7 @@ values came from an fp16 checkpoint, so nothing changes) and restored afterwards
 
 import torch
 
-from .blocks import AttnPrologue, FinalNorm, LayerPlan, PostBlock, StepState
+from .blocks import AttnPrologue, FinalNorm, LayerPlan, PostBlock, StepState, attend
 from .kernels_loss import IGNORE_INDEX, FusedLMLoss, loss_scale_of
 from . import warmup
 
@@ -136,14 +136,40 @@ def plan_of(model):
     return base.__dict__.get("_soupk_plan") if isinstance(base, torch.nn.Module) else None
 
 
+def row_segments(rowmap, seq_len):
+    """[(start, stop)] of each row's tokens in packed order, or None when some row's real tokens
+    are not one contiguous run of positions (then per-row causal attention would not be the base's
+    masked attention). One small host copy; `nonzero` has already synchronized."""
+    pos = rowmap.tolist()
+    segments, start = [], 0
+    for i in range(1, len(pos) + 1):
+        if i == len(pos) or pos[i] // seq_len != pos[i - 1] // seq_len:
+            if pos[i - 1] - pos[start] != i - 1 - start:
+                return None
+            segments.append((start, i))
+            start = i
+    return segments
+
+
+def labels_only_on_real_tokens(attention_mask, labels):
+    """True when every position the loss scores (next label not -100) is a real token. Base Soup
+    also scores masked positions whose next label is set; TRL's batches never have one (pads end
+    the row and carry -100), and a batch that does goes through Soup's own path."""
+    if labels.shape != attention_mask.shape:
+        return False
+    target = torch.nn.functional.pad(labels, (0, 1), value=IGNORE_INDEX)[:, 1:]
+    return not bool(((attention_mask == 0) & (target != IGNORE_INDEX)).any())
+
+
 def fusable_call(model, input_ids, attention_mask, position_ids, past_key_values, inputs_embeds,
-                 use_cache, logits_to_keep, kwargs):
+                 use_cache, logits_to_keep, kwargs, labels):
     return (model.training and torch.is_grad_enabled() and input_ids is not None
             and input_ids.dim() == 2 and attention_mask is not None and attention_mask.dim() == 2
             and inputs_embeds is None and past_key_values is None and position_ids is None
             and not use_cache and not logits_to_keep
             and not kwargs.get("output_attentions") and not kwargs.get("output_hidden_states")
-            and "shift_labels" not in kwargs)
+            and "shift_labels" not in kwargs
+            and labels_only_on_real_tokens(attention_mask, labels))
 
 
 def fused_forward(model, plan, input_ids, attention_mask, labels, num_items_in_batch=None):
@@ -162,16 +188,20 @@ def fused_forward(model, plan, input_ids, attention_mask, labels, num_items_in_b
     targets = torch.nn.functional.pad(labels, (0, 1), value=IGNORE_INDEX)[:, 1:]
     targets = targets.reshape(-1).index_select(0, rowmap)
 
-    # What Qwen2Model.forward builds, from the padded batch: positions, RoPE tables, the mask.
+    # What Qwen2Model.forward builds, from the padded batch: positions and RoPE tables; the padded
+    # mask only when some row's tokens are not contiguous (then attention runs padded, as the base).
     position_ids = torch.arange(seq_len, device=dev).unsqueeze(0)
     like = res.new_empty(()).expand(batch, seq_len, hidden)
     cos, sin = model.model.rotary_emb(like, position_ids)
-    mask = modeling_qwen2.create_causal_mask(config=model.config, inputs_embeds=like,
-                                             attention_mask=attention_mask, past_key_values=None,
-                                             position_ids=position_ids)
+    segments = row_segments(rowmap, seq_len)
+    mask = None
+    if segments is None:
+        mask = modeling_qwen2.create_causal_mask(config=model.config, inputs_embeds=like,
+                                                 attention_mask=attention_mask,
+                                                 past_key_values=None, position_ids=position_ids)
     step = StepState(rowmap, batch, seq_len, cos[0].contiguous(), sin[0].contiguous(),
                      torch.ones(1, dtype=torch.bool, device=dev),
-                     torch.ones(1, dtype=torch.float32, device=dev))
+                     torch.ones(1, dtype=torch.float32, device=dev), segments)
 
     delta = torch.zeros((tokens, hidden), dtype=torch.float16, device=dev)
     ones = plan.dropout_input((batch, seq_len, hidden), dev)
@@ -180,9 +210,7 @@ def fused_forward(model, plan, input_ids, attention_mask, labels, num_items_in_b
         keep_v, _ = plan.keep_mask(ones, lp.lora_v.dropout)
         res, q, k, v = AttnPrologue.apply(res, delta, keep_q, keep_v, drop_scale, lp.lora_q.a,
                                           lp.lora_q.b, lp.lora_v.a, lp.lora_v.b, lp, step)
-        attn, _ = plan.attention(lp.attn, q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-                                 mask, dropout=0.0, scaling=lp.attn.scaling,
-                                 sliding_window=lp.attn.sliding_window)
+        attn = attend(lp, q, k, v, step, plan.attention, mask)
         res, delta = PostBlock.apply(res, attn, lp, step)
     x = FinalNorm.apply(res, delta, plan.norm, step)
 
@@ -215,7 +243,7 @@ def patch_qwen2():
         plan = self.__dict__.get("_soupk_plan")
         if plan is not None and plan.active and labels is not None and fusable_call(
                 self, input_ids, attention_mask, position_ids, past_key_values, inputs_embeds,
-                use_cache, logits_to_keep, kwargs):
+                use_cache, logits_to_keep, kwargs, labels):
             return fused_forward(self, plan, input_ids, attention_mask, labels,
                                  kwargs.get("num_items_in_batch"))
         return original(self, input_ids=input_ids, attention_mask=attention_mask,

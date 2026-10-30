@@ -96,8 +96,9 @@ class LayerPlan:
 class StepState:
     """Per-forward facts shared by every layer."""
 
-    def __init__(self, rowmap, batch, seq_len, cos, sin, keep_all, unit):
+    def __init__(self, rowmap, batch, seq_len, cos, sin, keep_all, unit, segments):
         self.rowmap, self.batch, self.seq_len = rowmap, batch, seq_len
+        self.segments = segments  # [(start, stop)] of each row's tokens, or None
         self.cos, self.sin = cos, sin
         self.keep_all, self.unit = keep_all, unit  # placeholders where a kernel has no LoRA input
 
@@ -146,7 +147,8 @@ def _zeros_if_none(grad, like, shape=None, dtype=None):
 
 
 class AttnPrologue(torch.autograd.Function):
-    """residual + delta -> RMSNorm -> q|k|v matmul (+ LoRA on q and v) -> RoPE -> padded q, k, v."""
+    """residual + delta -> RMSNorm -> q|k|v matmul (+ LoRA on q and v) -> RoPE -> packed q, k, v
+    of shape (tokens, heads, head_dim)."""
 
     @staticmethod
     def forward(ctx, res, delta, keep_q, keep_v, drop_scale, aq, bq, av, bv, plan, step):
@@ -166,20 +168,18 @@ class AttnPrologue(torch.autograd.Function):
         lora_q = lora_aq @ bq.to(HALF).t()
         lora_av = xv @ av.to(HALF).t()
         lora_v = lora_av @ bv.to(HALF).t()
-        slots = step.batch * step.seq_len
-        q = torch.zeros((slots, plan.n_heads, plan.head_dim), dtype=HALF, device=dev)
-        k = torch.zeros((slots, plan.n_kv, plan.head_dim), dtype=HALF, device=dev)
-        v = torch.zeros_like(k)
-        qkv_rope_fwd_kernel[(res.shape[0], plan.n_heads + 2 * plan.n_kv)](
+        tokens = res.shape[0]
+        q = torch.empty((tokens, plan.n_heads, plan.head_dim), dtype=HALF, device=dev)
+        k = torch.empty((tokens, plan.n_kv, plan.head_dim), dtype=HALF, device=dev)
+        v = torch.empty_like(k)
+        qkv_rope_fwd_kernel[(tokens, plan.n_heads + 2 * plan.n_kv)](
             qkv, lora_q, lora_v, step.cos, step.sin, step.rowmap, q, k, v,
             plan.lora_q.scaling, plan.lora_v.scaling, step.seq_len,
             NQ=plan.n_heads, NKV=plan.n_kv, D=plan.head_dim, num_warps=1)
         ctx.save_for_backward(h, rstd, xq, xv, lora_aq, lora_av, keep_q, keep_v, drop_scale,
                               aq, bq, av, bv)
         ctx.plan, ctx.step = plan, step
-        shape = (step.batch, step.seq_len)
-        return h, q.view(*shape, plan.n_heads, plan.head_dim), \
-            k.view(*shape, plan.n_kv, plan.head_dim), v.view(*shape, plan.n_kv, plan.head_dim)
+        return h, q, k, v
 
     @staticmethod
     def backward(ctx, dh, dq, dk, dv):
@@ -188,16 +188,15 @@ class AttnPrologue(torch.autograd.Function):
         plan, step = ctx.plan, ctx.step
         tokens, hidden = h.shape
         dev = h.device
-        slots = step.batch * step.seq_len
-        dq = _zeros_if_none(dq, h, (step.batch, step.seq_len, plan.n_heads, plan.head_dim), HALF)
-        dk = _zeros_if_none(dk, h, (step.batch, step.seq_len, plan.n_kv, plan.head_dim), HALF)
-        dv = _zeros_if_none(dv, h, (step.batch, step.seq_len, plan.n_kv, plan.head_dim), HALF)
+        dq = _zeros_if_none(dq, h, (tokens, plan.n_heads, plan.head_dim), HALF)
+        dk = _zeros_if_none(dk, h, (tokens, plan.n_kv, plan.head_dim), HALF)
+        dv = _zeros_if_none(dv, h, (tokens, plan.n_kv, plan.head_dim), HALF)
         width = (plan.n_heads + 2 * plan.n_kv) * plan.head_dim
         dqkv = torch.empty((tokens, width), dtype=HALF, device=dev)
         dlora_q = torch.empty((tokens, plan.n_heads * plan.head_dim), dtype=HALF, device=dev)
         dlora_v = torch.empty((tokens, plan.n_kv * plan.head_dim), dtype=HALF, device=dev)
         qkv_rope_bwd_kernel[(tokens, plan.n_heads + 2 * plan.n_kv)](
-            dq.view(slots, -1), dk.view(slots, -1), dv.view(slots, -1), step.cos, step.sin,
+            dq, dk, dv, step.cos, step.sin,
             step.rowmap, dqkv, dlora_q, dlora_v, plan.lora_q.scaling, plan.lora_v.scaling,
             step.seq_len, NQ=plan.n_heads, NKV=plan.n_kv, D=plan.head_dim, num_warps=1)
         w = dequant_rows(plan.qkv, HALF, dev)
@@ -220,7 +219,8 @@ class AttnPrologue(torch.autograd.Function):
 
 
 class PostBlock(torch.autograd.Function):
-    """attention output -> o_proj -> + residual -> RMSNorm -> gate|up -> SiLU * up -> down_proj."""
+    """packed attention output (tokens, hidden) -> o_proj -> + residual -> RMSNorm -> gate|up ->
+    SiLU * up -> down_proj."""
 
     @staticmethod
     def forward(ctx, res, attn, plan, step):
@@ -230,11 +230,9 @@ class PostBlock(torch.autograd.Function):
     @staticmethod
     def _forward(ctx, res, attn, plan, step):
         dev = res.device
-        hidden = res.shape[1]
-        a = attn.reshape(-1, hidden).index_select(0, step.rowmap)
         w = dequant_rows(plan.o, HALF, dev)
-        o = a @ w.t()
-        del w, a
+        o = attn @ w.t()
+        del w
         h, rstd, x, _, _ = _norm_launch(res, o, plan.ln_post.weight,
                                         plan.ln_post.variance_epsilon, step)
         del o
@@ -277,11 +275,49 @@ class PostBlock(torch.autograd.Function):
         dres, do = _norm_backward(dx, h, rstd, plan.ln_post.weight, _zeros_if_none(dh, h), step)
         del dx
         w = dequant_rows(plan.o, HALF, dev)
-        da = do @ w
+        dattn = do @ w
         del w, do
-        dattn = torch.zeros((step.batch * step.seq_len, hidden), dtype=HALF, device=dev)
-        dattn.index_copy_(0, step.rowmap, da)
-        return dres, dattn.view(step.batch, step.seq_len, plan.n_heads, plan.head_dim), None, None
+        return dres, dattn, None, None
+
+
+def attend(lp, q, k, v, step, attention_fn, mask):
+    """SDPA on packed q, k, v; returns the packed output (tokens, heads * head_dim).
+
+    When each row's real tokens are contiguous (`step.segments`, always the case for TRL's padded
+    batches), every row runs on its own real length with the causal flag: the same keys and the
+    same softmax as the base's padded call with its mask, without the pad positions' work. Other
+    masks take the padded call itself."""
+    tokens = q.shape[0]
+    if step.segments is not None:
+        outs = []
+        for start, stop in step.segments:
+            qi = q[start:stop].unsqueeze(0).transpose(1, 2)
+            ki = k[start:stop].unsqueeze(0).transpose(1, 2)
+            vi = v[start:stop].unsqueeze(0).transpose(1, 2)
+            ki = repeat_kv(ki, lp.n_heads // lp.n_kv)
+            vi = repeat_kv(vi, lp.n_heads // lp.n_kv)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                qi, ki, vi, dropout_p=0.0, is_causal=stop - start > 1, scale=lp.attn.scaling)
+            outs.append(out.transpose(1, 2).reshape(stop - start, -1))
+        return torch.cat(outs, dim=0) if len(outs) > 1 else outs[0]
+    slots = step.batch * step.seq_len
+    shape = (step.batch, step.seq_len)
+    q_pad = q.new_zeros((slots,) + q.shape[1:]).index_copy(0, step.rowmap, q)
+    k_pad = k.new_zeros((slots,) + k.shape[1:]).index_copy(0, step.rowmap, k)
+    v_pad = v.new_zeros((slots,) + v.shape[1:]).index_copy(0, step.rowmap, v)
+    out, _ = attention_fn(lp.attn, q_pad.view(*shape, *q.shape[1:]).transpose(1, 2),
+                          k_pad.view(*shape, *k.shape[1:]).transpose(1, 2),
+                          v_pad.view(*shape, *v.shape[1:]).transpose(1, 2), mask, dropout=0.0,
+                          scaling=lp.attn.scaling, sliding_window=lp.attn.sliding_window)
+    return out.reshape(slots, -1).index_select(0, step.rowmap).view(tokens, -1)
+
+
+def repeat_kv(x, groups):
+    """(1, kv_heads, n, d) -> (1, kv_heads * groups, n, d), as transformers' repeat_kv."""
+    if groups == 1:
+        return x
+    b, heads, n, d = x.shape
+    return x[:, :, None].expand(b, heads, groups, n, d).reshape(b, heads * groups, n, d)
 
 
 class FinalNorm(torch.autograd.Function):

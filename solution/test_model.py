@@ -19,7 +19,7 @@ elif os.environ.get("TRITON_INTERPRET") == "1":
 else:
     pytest.skip("needs a CUDA GPU or TRITON_INTERPRET=1", allow_module_level=True)
 
-from solution.model import install_plan, patch_qwen2  # noqa: E402
+from solution.model import install_plan, patch_qwen2, row_segments  # noqa: E402
 
 
 def tiny_qlora_model(lora_dropout=0.0):
@@ -74,6 +74,20 @@ def batch(vocab=1000):
     return ids, mask, labels
 
 
+def batch_with(lengths, seq, holes=(), vocab=1000):
+    torch.manual_seed(6)
+    ids = torch.randint(0, vocab, (len(lengths), seq), device=DEV)
+    mask = torch.zeros_like(ids)
+    labels = torch.full_like(ids, -100)
+    for b, n in enumerate(lengths):
+        mask[b, :n] = 1
+        labels[b, n // 3:n] = ids[b, n // 3:n]
+    for b, t in holes:
+        mask[b, t] = 0
+        labels[b, t] = -100
+    return ids, mask, labels
+
+
 def reference(peft_model, ids, mask, labels):
     out = peft_model(input_ids=ids, attention_mask=mask, labels=labels, use_cache=False)
     out.loss.backward()
@@ -89,10 +103,16 @@ def reference(peft_model, ids, mask, labels):
     return out.loss.detach(), entropy, hit, rows, grads
 
 
-def test_fused_path_matches_transformers_and_peft():
+@pytest.mark.parametrize("case", ["padded", "no padding", "hole in a row"])
+def test_fused_path_matches_transformers_and_peft(case):
     patch_qwen2()
     peft_model = tiny_qlora_model()
-    ids, mask, labels = batch()
+    if case == "padded":
+        ids, mask, labels = batch()
+    elif case == "no padding":
+        ids, mask, labels = batch_with([16, 16], 16)
+    else:  # not contiguous: the fused path falls back to padded attention with the mask
+        ids, mask, labels = batch_with([20, 12], 20, holes=[(0, 2)])
     ref_loss, ref_entropy, ref_hit, ref_rows, ref_grads = reference(peft_model, ids, mask, labels)
     peft_model.zero_grad(set_to_none=True)
 
@@ -153,3 +173,20 @@ def test_embedding_is_restored_bit_for_bit_after_training():
     assert plan.embed.weight.dtype == torch.float16
     plan.deactivate()
     assert plan.embed.weight.dtype == before.dtype and torch.equal(plan.embed.weight, before)
+
+
+def test_row_segments():
+    rowmap = torch.tensor([0, 1, 2, 5, 6, 10])  # seq_len 5: rows 0 (0-2), 1 (0-1), 2 (0)
+    assert row_segments(rowmap, 5) == [(0, 3), (3, 5), (5, 6)]
+    assert row_segments(torch.tensor([0, 2, 5]), 5) is None  # a hole in row 0
+
+
+def test_a_masked_position_with_a_label_goes_through_soups_path():
+    patch_qwen2()
+    peft_model = tiny_qlora_model()
+    ids, mask, labels = batch_with([20, 12], 20, holes=[(0, 9)])  # label at 10 is set
+    plan = install_plan(peft_model, require_cuda=False)
+    plan.activate()
+    with torch.autocast(device_type=DEV, dtype=torch.float16):  # as accelerate runs training
+        out = peft_model(input_ids=ids, attention_mask=mask, labels=labels, use_cache=False)
+    assert out.logits is not None and plan.last_step is None

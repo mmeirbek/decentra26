@@ -14,7 +14,7 @@
 
 import torch
 
-from .model import install_plan, plan_of
+from .model import install_plan, labels_only_on_real_tokens, plan_of
 
 try:
     from soup_cli.utils.stream_loss_chunk import STEP_ATTR
@@ -31,7 +31,8 @@ def _fused_step_applies(trainer, model, inputs, plan):
             and not getattr(trainer, "aux_loss_enabled", False)
             and getattr(trainer, "label_smoother", None) is None
             and getattr(trainer, "compute_loss_func", None) is None
-            and getattr(trainer, "model_accepts_loss_kwargs", True))
+            and getattr(trainer, "model_accepts_loss_kwargs", True)
+            and labels_only_on_real_tokens(inputs["attention_mask"], inputs["labels"]))
 
 
 def _patch(owner, name, make):
