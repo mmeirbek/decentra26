@@ -51,10 +51,12 @@ def nf4():
     nf4 = torch.rand(16, device=dev)
     out = torch.empty(n, dtype=torch.float16, device=dev)
     rows = []
+    zero = torch.zeros(1, dtype=torch.int64, device=dev)  # one weight: every start at 0
     for block, warps in itertools.product((256, 512, 1024, 2048), (2, 4, 8)):
-        ms = bench(lambda: nf4_dequant_kernel[(triton.cdiv(n // 8, block),)](
-            words, scale_q, scale2, code, offset, nf4, out, n // 8, BLOCK=block, num_warps=warps,
-            enable_fp_fusion=False))
+        prog_weight = torch.zeros(n // 8 // block, dtype=torch.int32, device=dev)
+        ms = bench(lambda: nf4_dequant_kernel[(n // 8 // block,)](
+            words, scale_q, scale2, code, nf4, out, prog_weight, zero, zero, zero, offset,
+            BLOCK=block, num_warps=warps, enable_fp_fusion=False))
         rows.append((f"WORDS={block} warps={warps}", ms, (n // 2 + 2 * n) / ms / 1e6))
     report("nf4_dequant (gate_proj weight)", rows)
 
@@ -66,7 +68,7 @@ def gated():
         rows = []
         for block, warps in itertools.product((512, 1024, 2048, 4096), (2, 4, 8)):
             ms = bench(lambda: gated_act_kernel[(T, triton.cdiv(I, block))](
-                gu, act, I=I, BLOCK=block, BACKWARD=backward, num_warps=warps))
+                gu, act, int(backward), I=I, BLOCK=block, num_warps=warps))
             moved = T * I * 2 * (5 if backward else 3)
             rows.append((f"BLOCK={block} warps={warps}", ms, moved / ms / 1e6))
         report(f"gated_act {'backward' if backward else 'forward'}", rows)
@@ -89,11 +91,11 @@ def norms():
         for warps in (2, 4, 8, 16):
             ms = bench(lambda: add_rmsnorm_fwd_kernel[(T,)](
                 res, delta, w, h, rstd, x, xhat, rowmap, keep, keep, scale, xq, xv, bq, bv, 1e-6,
-                H=H, BLOCK=2048, WITH_LORA=with_lora, num_warps=warps))
+                int(with_lora), H=H, BLOCK=2048, num_warps=warps))
             rows.append((f"fwd warps={warps}", ms, T * H * (4 + 2 + 4 + 2 + 2 + (5 if with_lora else 0)) / ms / 1e6))
             ms = bench(lambda: add_rmsnorm_bwd_kernel[(T,)](
-                x, xhat, rstd, w, dres_out, dres, xv, bq, bv, scale, xq, xv,
-                H=H, BLOCK=2048, WITH_LORA=with_lora, num_warps=warps))
+                x, xhat, rstd, w, dres_out, dres, xv, bq, bv, scale, xq, xv, int(with_lora),
+                H=H, BLOCK=2048, num_warps=warps))
             rows.append((f"bwd warps={warps}", ms, T * H * (2 + 2 + 4 + 4 + 2 + (4 if with_lora else 0)) / ms / 1e6))
         report(f"add_rmsnorm with_lora={with_lora}", rows)
 
@@ -108,8 +110,8 @@ def loss():
     rows = []
     for block, warps in itertools.product((2048, 4096, 8192), (4, 8, 16)):
         work = logits.clone()
-        ms = bench(lambda: lm_loss_kernel[(rows_n,)](work, target, gscale, *out, V, V=V, BLOCK=block,
-                                                     WITH_GRAD=True, num_warps=warps))
+        ms = bench(lambda: lm_loss_kernel[(rows_n,)](work, target, gscale, *out, V, 1, V=V,
+                                                     BLOCK=block, num_warps=warps))
         rows.append((f"BLOCK={block} warps={warps}", ms, rows_n * V * 6 / ms / 1e6))
     report("lm_loss (256 tokens, with grad)", rows)
 
