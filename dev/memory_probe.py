@@ -41,10 +41,58 @@ def report(tag):
         print(f"[memprobe]   {size / 2**20:8.1f} MiB  x{counts[key]:<5d} {key}", flush=True)
 
 
+def phase(tag):
+    """Peak allocated / reserved since the previous phase mark, then a fresh peak."""
+    print(f"[memprobe] phase peak up to '{tag}': allocated "
+          f"{torch.cuda.max_memory_allocated() / 2**20:.0f} MiB, reserved "
+          f"{torch.cuda.max_memory_reserved() / 2**20:.0f} MiB (now {torch.cuda.memory_allocated() / 2**20:.0f}"
+          f" / {torch.cuda.memory_reserved() / 2**20:.0f})", flush=True)
+    torch.cuda.reset_peak_memory_stats()
+
+
 def install():
-    from . import kernels_loss, model
+    import peft
+    import transformers
+
+    from . import kernels_loss, model, trainer
 
     torch.cuda.memory._record_memory_history(max_entries=200000)
+    phase("apply")
+
+    prepare = peft.prepare_model_for_kbit_training
+
+    def prepare_model_for_kbit_training(*a, **k):
+        phase("model loaded (before peft's k-bit preparation)")
+        out = prepare(*a, **k)
+        phase("peft's k-bit preparation")
+        return out
+
+    peft.prepare_model_for_kbit_training = prepare_model_for_kbit_training
+    original_install = trainer.install_plan
+
+    def install_plan(*a, **k):
+        phase("get_peft_model and the rest of Soup's setup")
+        out = original_install(*a, **k)
+        phase("install_plan")
+        return out
+
+    trainer.install_plan = install_plan
+
+    class StepPeaks(transformers.TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step <= 8 or state.global_step % 16 == 0:
+                phase(f"step {state.global_step - 1}")
+
+        def on_train_end(self, args, state, control, **kwargs):
+            phase("last steps")
+
+    original_init = transformers.Trainer.__init__
+
+    def init(self, *a, **k):
+        original_init(self, *a, **k)
+        self.add_callback(StepPeaks())
+
+    transformers.Trainer.__init__ = init
     calls = {"n": 0}
     original = kernels_loss.FusedLMLoss.forward
 
@@ -62,8 +110,10 @@ def install():
     original_activate = model.ModelPlan.activate
 
     def activate(self):
+        phase("trainer setup")
         report("before plan.activate (model loaded, before training)")
         original_activate(self)
         report("after plan.activate")
+        phase("plan.activate")
 
     model.ModelPlan.activate = activate

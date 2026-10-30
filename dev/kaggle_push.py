@@ -161,6 +161,8 @@ def main():
     parser.add_argument("--slug", default="soup-kernel-dev")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--probe-trace", action="store_true",
+                        help="profile steps 6-8 with Python stacks, attribute GPU idle gaps")
     parser.add_argument("--no-recompute-mlp", action="store_true",
                         help="experiment: run with model.RECOMPUTE_MLP = False")
     parser.add_argument("--ab", nargs=2, metavar=("REF_A", "REF_B"),
@@ -189,6 +191,10 @@ def main():
                         "    patch_soup_wrapper()\n    from . import _probe\n    _probe.install()\n"))
     if args.tune:
         extra.append(("solution/_tune.py", REPO / "dev" / "tune_probe.py"))
+    if args.probe_trace:
+        extra.append(("solution/_trace.py", REPO / "dev" / "trace_probe.py"))
+        replace.append(("solution/__init__.py", "    patch_soup_wrapper()\n",
+                        "    patch_soup_wrapper()\n    from . import _trace\n    _trace.install()\n"))
     if args.probe_memory:
         extra.append(("solution/_memprobe.py", REPO / "dev" / "memory_probe.py"))
         replace.append(("solution/__init__.py", "    patch_soup_wrapper()\n",
