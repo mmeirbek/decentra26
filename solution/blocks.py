@@ -19,7 +19,7 @@ from .kernels_mlp import gated_act_kernel
 from .kernels_nf4 import NF4Weight, dequant_rows
 from .kernels_norm import add_rmsnorm_bwd_kernel, add_rmsnorm_fwd_kernel
 
-ACT_BLOCK = 1024
+ACT_BLOCK_FWD, ACT_BLOCK_BWD, ACT_WARPS = 1024, 512, 8  # fastest on a T4
 HALF = torch.float16
 
 
@@ -260,8 +260,8 @@ class PostBlock(torch.autograd.Function):
         gu = n.x @ w.t()
         del w
         act = torch.empty((res.shape[0], plan.inter), dtype=HALF, device=dev)
-        gated_act_kernel[(res.shape[0], triton.cdiv(plan.inter, ACT_BLOCK))](
-            gu, act, I=plan.inter, BLOCK=ACT_BLOCK, BACKWARD=False, num_warps=4)
+        gated_act_kernel[(res.shape[0], triton.cdiv(plan.inter, ACT_BLOCK_FWD))](
+            gu, act, I=plan.inter, BLOCK=ACT_BLOCK_FWD, BACKWARD=False, num_warps=ACT_WARPS)
         w = dequant_rows(plan.down, HALF, dev)
         out = act @ w.t()
         del w, act
@@ -285,8 +285,8 @@ class PostBlock(torch.autograd.Function):
             gu = kept @ w_gu.t()
         else:
             gu = kept
-        gated_act_kernel[(tokens, triton.cdiv(plan.inter, ACT_BLOCK))](
-            gu, dact, I=plan.inter, BLOCK=ACT_BLOCK, BACKWARD=True, num_warps=4)
+        gated_act_kernel[(tokens, triton.cdiv(plan.inter, ACT_BLOCK_BWD))](
+            gu, dact, I=plan.inter, BLOCK=ACT_BLOCK_BWD, BACKWARD=True, num_warps=ACT_WARPS)
         del dact
         if w_gu is None:
             w_gu = dequant_rows(plan.gate_up, HALF, dev)

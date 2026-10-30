@@ -16,7 +16,8 @@ import torch
 import triton
 import triton.language as tl
 
-WORDS_PER_PROGRAM = 1024  # 32-bit words of packed codes: 8 weights each
+WORDS_PER_PROGRAM = 256  # 32-bit words of packed codes, 8 weights each (fastest on a T4)
+NF4_WARPS = 8
 WEIGHTS_PER_SCALE = 64
 SCALES_PER_SCALE2 = 256
 
@@ -71,7 +72,7 @@ class NF4Weight:
         grid = (triton.cdiv(n_words, WORDS_PER_PROGRAM),)
         nf4_dequant_kernel[grid](self.words, self.scale_q, self.scale2, self.scale_code,
                                  self.offset, self.nf4, out, n_words, BLOCK=WORDS_PER_PROGRAM,
-                                 num_warps=4, enable_fp_fusion=False)
+                                 num_warps=NF4_WARPS, enable_fp_fusion=False)
         return out
 
 

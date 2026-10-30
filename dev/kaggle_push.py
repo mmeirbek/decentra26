@@ -23,6 +23,11 @@ KIT = "https://github.com/MakazhanAlpamys/soup-kernel-challenge.git"
 KIT_COMMIT = "c7c2fcd"
 
 
+NOTEBOOK_METADATA = {"kernelspec": {"display_name": "Python 3", "language": "python",
+                                    "name": "python3"},
+                     "language_info": {"name": "python"}}
+
+
 def solution_archive(replace=(), extra=()):
     """solution/ as a base64 tar.gz; `replace` holds (file, old, new) source edits and `extra`
     (archive name, source path) files added for experiments."""
@@ -51,21 +56,26 @@ def code(*lines):
             "source": [line + "\n" for line in lines]}
 
 
-def notebook(archive, repeats, profile, only_solution=False, tune=False):
+def notebook(archive, repeats, profile, only_solution=False, tune=False, tests_only=False):
     template = json.loads((REPO / "templates" / "kaggle_notebook.ipynb").read_text())
     install = [c for c in template["cells"] if c["cell_type"] == "code"][1]  # GPU check + pip
     run_args = f"--repeats {repeats}" + (" --profile" if profile else "") + \
         (" --only solution" if only_solution else "")
+    clone = code("import base64, io, shutil, subprocess, tarfile",
+                 "shutil.rmtree('/kaggle/working/repo', ignore_errors=True)",
+                 f"subprocess.run(['git', 'clone', '-q', '{KIT}', '/kaggle/working/repo'], check=True)",
+                 f"subprocess.run(['git', '-C', '/kaggle/working/repo', 'checkout', '-q', '{KIT_COMMIT}'], check=True)",
+                 "shutil.rmtree('/kaggle/working/repo/solution')",
+                 f"ARCHIVE = '{archive}'",
+                 "tarfile.open(fileobj=io.BytesIO(base64.b64decode(ARCHIVE))).extractall('/kaggle/working/repo')")
+    if tests_only:
+        return {"cells": [install, clone, code(
+            "!cd /kaggle/working/repo && python -m pytest solution -x -q -p no:cacheprovider "
+            "--tb=long -W ignore 2>&1 | tail -150")], "metadata": NOTEBOOK_METADATA,
+            "nbformat": 4, "nbformat_minor": 5}
     cells = [
         install,
-        code("import base64, io, shutil, subprocess, tarfile",
-             "shutil.rmtree('/kaggle/working/repo', ignore_errors=True)",
-             f"subprocess.run(['git', 'clone', '-q', '{KIT}', '/kaggle/working/repo'], check=True)",
-             f"subprocess.run(['git', '-C', '/kaggle/working/repo', 'checkout', '-q', '{KIT_COMMIT}'], check=True)",
-             "shutil.rmtree('/kaggle/working/repo/solution')",
-             f"ARCHIVE = '{archive}'",
-             "tarfile.open(fileobj=io.BytesIO(base64.b64decode(ARCHIVE))).extractall('/kaggle/working/repo')",
-             "print(sorted(p.name for p in __import__('pathlib').Path('/kaggle/working/repo/solution').iterdir()))"),
+        clone,
         code("import torch, torch.nn.functional as F",
              "from torch.nn.attention import SDPBackend, sdpa_kernel",
              "q = torch.randn(1, 12, 300, 128, device='cuda', dtype=torch.float16, requires_grad=True)",
@@ -104,10 +114,7 @@ def notebook(archive, repeats, profile, only_solution=False, tune=False):
              "    print('summary failed:', repr(exc))",
              "shutil.rmtree('/kaggle/working/repo', ignore_errors=True)"),
     ]
-    return {"cells": cells, "metadata": {"kernelspec": {"display_name": "Python 3",
-                                                        "language": "python", "name": "python3"},
-                                         "language_info": {"name": "python"}},
-            "nbformat": 4, "nbformat_minor": 5}
+    return {"cells": cells, "metadata": NOTEBOOK_METADATA, "nbformat": 4, "nbformat_minor": 5}
 
 
 def main():
@@ -118,6 +125,8 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--no-recompute-mlp", action="store_true",
                         help="experiment: run with model.RECOMPUTE_MLP = False")
+    parser.add_argument("--tests-only", action="store_true",
+                        help="only run `pytest solution` on the GPU, with full tracebacks")
     parser.add_argument("--only-solution", action="store_true",
                         help="train only the solution (quicker; the checks that need the base fail)")
     parser.add_argument("--tune", action="store_true",
@@ -140,7 +149,8 @@ def main():
         extra.append(("solution/_tune.py", REPO / "dev" / "tune_probe.py"))
     (out / "notebook.ipynb").write_text(json.dumps(notebook(solution_archive(replace, extra),
                                                             args.repeats, args.profile,
-                                                            args.only_solution, args.tune),
+                                                            args.only_solution, args.tune,
+                                                            args.tests_only),
                                                    indent=1))
     meta = {"id": f"{args.user}/{args.slug}", "title": args.slug, "code_file": "notebook.ipynb",
             "language": "python", "kernel_type": "notebook", "is_private": True,

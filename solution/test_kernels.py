@@ -19,7 +19,7 @@ else:
     pytest.skip("needs a CUDA GPU or TRITON_INTERPRET=1", allow_module_level=True)
 
 from solution import kernels_loss  # noqa: E402
-from solution.blocks import ACT_BLOCK  # noqa: E402
+from solution.blocks import ACT_BLOCK_BWD, ACT_BLOCK_FWD, ACT_WARPS  # noqa: E402
 from solution.kernels_attn import qkv_rope_bwd_kernel, qkv_rope_fwd_kernel  # noqa: E402
 from solution.kernels_mlp import gated_act_kernel  # noqa: E402
 from solution.kernels_nf4 import NF4Weight  # noqa: E402
@@ -194,8 +194,8 @@ def test_gated_act_forward_and_backward():
     tokens, inter = 9, 8960 if DEV == "cuda" else 320
     gu = torch.randn(tokens, 2 * inter, device=DEV).half()
     act = torch.empty(tokens, inter, dtype=torch.float16, device=DEV)
-    grid = (tokens, -(-inter // ACT_BLOCK))
-    gated_act_kernel[grid](gu, act, I=inter, BLOCK=ACT_BLOCK, BACKWARD=False, num_warps=4)
+    gated_act_kernel[(tokens, -(-inter // ACT_BLOCK_FWD))](gu, act, I=inter, BLOCK=ACT_BLOCK_FWD,
+                                                           BACKWARD=False, num_warps=ACT_WARPS)
     g = gu[:, :inter].float().requires_grad_()
     u = gu[:, inter:].float().requires_grad_()
     ref = F.silu(g) * u
@@ -203,7 +203,8 @@ def test_gated_act_forward_and_backward():
     dact = torch.randn(tokens, inter, device=DEV).half()
     ref.backward(dact.float())
     buf = gu.clone()
-    gated_act_kernel[grid](buf, dact, I=inter, BLOCK=ACT_BLOCK, BACKWARD=True, num_warps=4)
+    gated_act_kernel[(tokens, -(-inter // ACT_BLOCK_BWD))](buf, dact, I=inter, BLOCK=ACT_BLOCK_BWD,
+                                                           BACKWARD=True, num_warps=ACT_WARPS)
     close(buf[:, :inter], g.grad.half(), 2e-3)
     close(buf[:, inter:], u.grad.half(), 2e-3)
 

@@ -48,6 +48,7 @@ def tiny_qlora_model(lora_dropout=0.0):
                     q.bias = torch.nn.Parameter(lin.bias.data.clone(), requires_grad=False)
                 setattr(parent, name, q.to(DEV))
     model.to(DEV)
+    model.is_loaded_in_4bit = True  # as from_pretrained marks it: peft then wraps with its bnb LoRA
     for param in model.parameters():  # what prepare_model_for_kbit_training does
         param.requires_grad = False
         if param.dtype == torch.float16 and param.__class__.__name__ != "Params4bit":
