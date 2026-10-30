@@ -19,7 +19,7 @@ from .kernels_mlp import gated_act_kernel
 from .kernels_nf4 import NF4Group, dequant_group
 from .kernels_norm import add_rmsnorm_bwd_kernel, add_rmsnorm_fwd_kernel, lora_inputs_kernel
 
-ACT_BLOCK_FWD, ACT_BLOCK_BWD, ACT_WARPS = 1024, 512, 8  # fastest on a T4
+ACT_BLOCK, ACT_WARPS = 1024, 8  # fastest on a T4 (one block size: one compiled variant)
 HALF = torch.float16
 
 
@@ -151,7 +151,7 @@ def _norm_launch(res, delta, weight, eps, step, keep_q=None, keep_v=None, drop_s
         res, delta, weight, h, rstd, x, xhat, step.rowmap,
         keep_q if with_lora else step.no_keep, keep_v if with_lora else step.no_keep,
         drop_scale if with_lora else step.unit, xq, xv, bits_q, bits_v, eps,
-        H=hidden, BLOCK=triton.next_power_of_2(hidden), WITH_LORA=with_lora, num_warps=8)
+        int(with_lora), H=hidden, BLOCK=triton.next_power_of_2(hidden), num_warps=8)
     return Normed(h=h, rstd=rstd, x=x, xhat=xhat, xq=xq, xv=xv, bits_q=bits_q, bits_v=bits_v)
 
 
@@ -165,7 +165,7 @@ def _norm_backward(dx, xhat, rstd, weight, dres_out, step, bits_q=None, bits_v=N
         dx, xhat, rstd, weight, dres_out, dres, ddelta,
         bits_q if with_lora else step.no_bits, bits_v if with_lora else step.no_bits,
         drop_scale if with_lora else step.unit, dxq if with_lora else dx, dxv if with_lora else dx,
-        H=hidden, BLOCK=triton.next_power_of_2(hidden), WITH_LORA=with_lora, num_warps=8)
+        int(with_lora), H=hidden, BLOCK=triton.next_power_of_2(hidden), num_warps=8)
     return dres, ddelta
 
 
@@ -283,8 +283,8 @@ class PostBlock(torch.autograd.Function):
         gu = torch.mm(n.x, w.t(), out=_rows(tokens, 2 * plan.inter, device=dev))
         del w
         act = _rows(tokens, plan.inter, device=dev)
-        gated_act_kernel[(res.shape[0], triton.cdiv(plan.inter, ACT_BLOCK_FWD))](
-            gu, act, I=plan.inter, BLOCK=ACT_BLOCK_FWD, BACKWARD=False, num_warps=ACT_WARPS)
+        gated_act_kernel[(res.shape[0], triton.cdiv(plan.inter, ACT_BLOCK))](
+            gu, act, 0, I=plan.inter, BLOCK=ACT_BLOCK, num_warps=ACT_WARPS)
         w = dequant_group(plan.down, step.workspace)
         out = torch.mm(act, w.t(), out=_rows(tokens, hidden, device=dev))
         del w, act
@@ -315,8 +315,8 @@ class PostBlock(torch.autograd.Function):
             del x
         else:
             gu = kept
-        gated_act_kernel[(tokens, triton.cdiv(plan.inter, ACT_BLOCK_BWD))](
-            gu, dact, I=plan.inter, BLOCK=ACT_BLOCK_BWD, BACKWARD=True, num_warps=ACT_WARPS)
+        gated_act_kernel[(tokens, triton.cdiv(plan.inter, ACT_BLOCK))](
+            gu, dact, 1, I=plan.inter, BLOCK=ACT_BLOCK, num_warps=ACT_WARPS)
         del dact
         if w_gu is None:
             w_gu = dequant_group(plan.gate_up, step.workspace)

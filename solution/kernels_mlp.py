@@ -16,9 +16,8 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
-def gated_act_kernel(gu_ptr, act_ptr, I: tl.constexpr, BLOCK: tl.constexpr,
-                     BACKWARD: tl.constexpr):
+@triton.jit(do_not_specialize=["backward"])
+def gated_act_kernel(gu_ptr, act_ptr, backward, I: tl.constexpr, BLOCK: tl.constexpr):
     tok = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     live = cols < I
@@ -29,7 +28,7 @@ def gated_act_kernel(gu_ptr, act_ptr, I: tl.constexpr, BLOCK: tl.constexpr,
     u = tl.load(up_at, mask=live, other=0.0).to(tl.float32)
     denom = 1.0 + tl.exp(-g)
     silu = g / denom
-    if BACKWARD:
+    if backward != 0:
         dact = tl.load(act_at, mask=live, other=0.0).to(tl.float32)
         sig = 1.0 / denom
         dsilu = dact * u

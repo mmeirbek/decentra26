@@ -46,7 +46,7 @@ def wait():
 def _compile_all(config):
     import triton
 
-    from .blocks import ACT_BLOCK_BWD, ACT_BLOCK_FWD, ACT_WARPS
+    from .blocks import ACT_BLOCK, ACT_WARPS
     from .kernels_attn import qkv_rope_bwd_kernel, qkv_rope_fwd_kernel
     from .kernels_loss import VOCAB_BLOCK, lm_loss_kernel
     from .kernels_mlp import gated_act_kernel
@@ -75,30 +75,24 @@ def _compile_all(config):
                                         t(torch.int32), t(i64), t(i64), t(i64), t(f32),
                                         BLOCK=WORDS_PER_PROGRAM, num_warps=NF4_WARPS,
                                         enable_fp_fusion=False, grid=grid))
-        for with_lora in (True, False):
-            ready(add_rmsnorm_fwd_kernel.warmup(
-                t(f32), t(f16), t(f32), t(f32), t(f32), t(f16), t(f16), t(i64), t(torch.bool),
-                t(torch.bool), t(f32), t(f16), t(f16), t(u8), t(u8), 1e-6, H=hidden, BLOCK=block,
-                WITH_LORA=with_lora, num_warps=8, grid=grid))
-            ready(add_rmsnorm_bwd_kernel.warmup(
-                t(f16), t(f16), t(f32), t(f32), t(f32), t(f32), t(f16), t(u8), t(u8), t(f32),
-                t(f16), t(f16), H=hidden, BLOCK=block, WITH_LORA=with_lora, num_warps=8,
-                grid=grid))
+        ready(add_rmsnorm_fwd_kernel.warmup(
+            t(f32), t(f16), t(f32), t(f32), t(f32), t(f16), t(f16), t(i64), t(torch.bool),
+            t(torch.bool), t(f32), t(f16), t(f16), t(u8), t(u8), 1e-6, 0, H=hidden, BLOCK=block,
+            num_warps=8, grid=grid))
+        ready(add_rmsnorm_bwd_kernel.warmup(
+            t(f16), t(f16), t(f32), t(f32), t(f32), t(f32), t(f16), t(u8), t(u8), t(f32), t(f16),
+            t(f16), 0, H=hidden, BLOCK=block, num_warps=8, grid=grid))
         ready(lora_inputs_kernel.warmup(t(f16), t(f32), t(u8), t(u8), t(f32), t(f16), t(f16),
                                         H=hidden, BLOCK=block, num_warps=8, grid=grid))
         for kernel in (qkv_rope_fwd_kernel, qkv_rope_bwd_kernel):
             ready(kernel.warmup(t(f16), t(f16), t(f16), t(f32), t(f32), t(i64), t(f16), t(f16),
                                 t(f16), 2.0, 2.0, 512, NQ=n_q, NKV=n_kv, D=head_dim, num_warps=1,
                                 grid=grid))
-        for backward, act_block in ((False, ACT_BLOCK_FWD), (True, ACT_BLOCK_BWD)):
-            ready(gated_act_kernel.warmup(t(f16), t(f16), I=config.intermediate_size,
-                                          BLOCK=act_block, BACKWARD=backward, num_warps=ACT_WARPS,
-                                          grid=grid))
-        for with_grad in (True, False):
-            ready(lm_loss_kernel.warmup(t(f16), t(i64), t(f32), t(f32), t(f32), t(torch.int32),
-                                        vocab, V=vocab, BLOCK=VOCAB_BLOCK, WITH_GRAD=with_grad,
-                                        num_warps=8, grid=grid))
-        print(f"[solution] background compile of 12 kernel variants took "
+        ready(gated_act_kernel.warmup(t(f16), t(f16), 0, I=config.intermediate_size,
+                                      BLOCK=ACT_BLOCK, num_warps=ACT_WARPS, grid=grid))
+        ready(lm_loss_kernel.warmup(t(f16), t(i64), t(f32), t(f32), t(f32), t(torch.int32), vocab,
+                                    0, V=vocab, BLOCK=VOCAB_BLOCK, num_warps=8, grid=grid))
+        print(f"[solution] background compile of 8 kernel variants took "
               f"{time.perf_counter() - started:.1f} s", flush=True)
     except Exception as exc:  # noqa: BLE001 - a failed warm-up only means compiling at first use
         print(f"[solution] background compile skipped: {exc!r}", flush=True)

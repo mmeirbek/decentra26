@@ -79,14 +79,17 @@ class NF4Group:
         words = [p.data.view(-1).view(torch.int32) for p in params]
         scale_q = [qs.absmax for qs in states]
         scale2 = [qs.state2.absmax for qs in states]
-        if share and len(params) > 1:
-            words, scale_q, scale2 = (self._share(parts) for parts in (words, scale_q, scale2))
+        if len(params) == 1:
+            self.words, self.scale_q, self.scale2 = words[0], scale_q[0], scale2[0]
+        elif share:
+            (self.words, words), (self.scale_q, scale_q), (self.scale2, scale2) = (
+                self._share(parts) for parts in (words, scale_q, scale2))
             for p, qs, wv, sq, s2 in zip(params, states, words, scale_q, scale2):
                 p.data = wv.view(torch.uint8).view(p.data.shape)
                 qs.absmax, qs.state2.absmax = sq, s2
-        self.words = torch.cat(words) if len(words) > 1 else words[0]
-        self.scale_q = torch.cat(scale_q) if len(scale_q) > 1 else scale_q[0]
-        self.scale2 = torch.cat(scale2) if len(scale2) > 1 else scale2[0]
+        else:  # a copy for the kernel next to bitsandbytes' own tensors (tests)
+            self.words, self.scale_q, self.scale2 = (torch.cat(parts)
+                                                     for parts in (words, scale_q, scale2))
         offsets = [float(qs.offset) for qs in states]
 
         def starts(parts):
@@ -107,13 +110,14 @@ class NF4Group:
 
     @staticmethod
     def _share(parts):
-        """One buffer holding `parts` back to back, and views of it in their place."""
+        """One buffer holding `parts` back to back, and views of it to use in their place (the
+        originals are then dropped, so the group costs no memory of its own)."""
         whole = torch.cat([t.reshape(-1) for t in parts])
         views, at = [], 0
         for t in parts:
             views.append(whole[at:at + t.numel()].view(t.shape))
             at += t.numel()
-        return views
+        return whole, views
 
     def dequant(self, out=None):
         """The weights as one dense (sum of out_features, in_features) tensor in compute dtype."""

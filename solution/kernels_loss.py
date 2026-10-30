@@ -25,9 +25,9 @@ CHUNK = 128
 VOCAB_BLOCK = 4096
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["with_grad"])
 def lm_loss_kernel(logits_ptr, target_ptr, gscale_ptr, loss_ptr, entropy_ptr, hit_ptr, row_stride,
-                   V: tl.constexpr, BLOCK: tl.constexpr, WITH_GRAD: tl.constexpr):
+                   with_grad, V: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     base = logits_ptr + row.to(tl.int64) * row_stride
     target = tl.load(target_ptr + row)
@@ -60,7 +60,7 @@ def lm_loss_kernel(logits_ptr, target_ptr, gscale_ptr, loss_ptr, entropy_ptr, hi
     tl.store(entropy_ptr + row, lse - sum_exp_x / sum_exp)
     tl.store(hit_ptr + row, (labelled & (best_idx == target)).to(tl.int32))
 
-    if WITH_GRAD:
+    if with_grad != 0:
         g = tl.where(labelled, tl.load(gscale_ptr), 0.0)
         for start in range(0, V, BLOCK):
             cols = start + tl.arange(0, BLOCK)
@@ -118,8 +118,8 @@ class FusedLMLoss(torch.autograd.Function):
             torch.mm(hidden[start:stop], weight.t(), out=chunk_logits)
             lm_loss_kernel[(stop - start,)](
                 chunk_logits, targets[start:stop], gscale, token_loss[start:stop],
-                entropy[start:stop], hit[start:stop], vocab, V=vocab, BLOCK=VOCAB_BLOCK,
-                WITH_GRAD=labelled_stop > start, num_warps=8)
+                entropy[start:stop], hit[start:stop], vocab, int(labelled_stop > start), V=vocab,
+                BLOCK=VOCAB_BLOCK, num_warps=8)
             if labelled_stop > start:
                 torch.mm(chunk_logits[:labelled_stop - start], weight,
                          out=grad[start:labelled_stop])

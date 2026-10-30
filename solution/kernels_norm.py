@@ -11,7 +11,7 @@ does and hand the matmuls the fp16 they would have received anyway:
 For backward only xhat (fp16) and 1/rms are kept, not the fp32 residual: that is all the RMSNorm
 gradient reads.
 
-Before attention (WITH_LORA) the same pass also writes the LoRA inputs of q_proj and v_proj,
+Before attention (with_lora) the same pass also writes the LoRA inputs of q_proj and v_proj,
 x * dropout_mask * dropout_scale in fp16, with the masks drawn by torch's own dropout (so the
 randomness is the base run's), and keeps those masks for backward as bits of the real tokens only.
 """
@@ -20,11 +20,11 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["with_lora"])
 def add_rmsnorm_fwd_kernel(res_ptr, delta_ptr, w_ptr, h_ptr, rstd_ptr, x_ptr, xhat_ptr,
                            rowmap_ptr, keep_q_ptr, keep_v_ptr, drop_scale_ptr, xq_ptr, xv_ptr,
-                           bits_q_ptr, bits_v_ptr, eps,
-                           H: tl.constexpr, BLOCK: tl.constexpr, WITH_LORA: tl.constexpr):
+                           bits_q_ptr, bits_v_ptr, eps, with_lora,
+                           H: tl.constexpr, BLOCK: tl.constexpr):
     tok = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
     live = cols < H
@@ -38,7 +38,7 @@ def add_rmsnorm_fwd_kernel(res_ptr, delta_ptr, w_ptr, h_ptr, rstd_ptr, x_ptr, xh
     tl.store(xhat_ptr + offs, xhat.to(tl.float16), mask=live)
     y = tl.load(w_ptr + cols, mask=live, other=0.0) * xhat
     tl.store(x_ptr + offs, y.to(tl.float16), mask=live)
-    if WITH_LORA:
+    if with_lora != 0:
         pos = tl.load(rowmap_ptr + tok).to(tl.int64) * H + cols
         drop_scale = tl.load(drop_scale_ptr)
         keep_q = tl.load(keep_q_ptr + pos, mask=live, other=0) != 0
@@ -56,16 +56,16 @@ def add_rmsnorm_fwd_kernel(res_ptr, delta_ptr, w_ptr, h_ptr, rstd_ptr, x_ptr, xh
         tl.store(bits_v_ptr + byte_offs, packed_v.to(tl.uint8), mask=byte_live)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["with_lora"])
 def add_rmsnorm_bwd_kernel(dx_ptr, xhat_ptr, rstd_ptr, w_ptr, dres_out_ptr, dres_ptr, ddelta_ptr,
-                           bits_q_ptr, bits_v_ptr, drop_scale_ptr, dxq_ptr, dxv_ptr,
-                           H: tl.constexpr, BLOCK: tl.constexpr, WITH_LORA: tl.constexpr):
+                           bits_q_ptr, bits_v_ptr, drop_scale_ptr, dxq_ptr, dxv_ptr, with_lora,
+                           H: tl.constexpr, BLOCK: tl.constexpr):
     tok = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
     live = cols < H
     offs = tok.to(tl.int64) * H + cols
     dy = tl.load(dx_ptr + offs, mask=live, other=0.0).to(tl.float32)
-    if WITH_LORA:
+    if with_lora != 0:
         bit = tl.arange(0, 8)[None, :]
         byte_cols = tl.arange(0, BLOCK // 8)
         byte_offs = tok.to(tl.int64) * (H // 8) + byte_cols
