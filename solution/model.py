@@ -61,6 +61,7 @@ class ModelPlan:
         self.last_step = None
         self.active = False
         self.fused_steps = 0
+        self.workspace = None
         self._ones = None
         self._drop_scale = {}
 
@@ -73,6 +74,9 @@ class ModelPlan:
         if weight.dtype != torch.float16:
             self._embed_dtype = weight.dtype
             weight.data = weight.data.to(torch.float16)
+        largest = max(sum(w.numel for w in group) for lp in self.layers
+                      for group in (lp.qkv, lp.o, lp.gate_up, lp.down))
+        self.workspace = torch.empty(largest, dtype=torch.float16, device=weight.device)
         self.active = True
 
     def deactivate(self):
@@ -80,6 +84,7 @@ class ModelPlan:
         if self.active:
             print(f"[solution] fused forward ran for {self.fused_steps} training steps", flush=True)
         self.active = False
+        self.workspace = None
         dtype = getattr(self, "_embed_dtype", None)
         if dtype is not None:
             self.embed.weight.data = self.embed.weight.data.to(dtype)
@@ -200,7 +205,8 @@ def fused_forward(model, plan, input_ids, attention_mask, labels, num_items_in_b
         mask = modeling_qwen2.create_causal_mask(config=model.config, inputs_embeds=like,
                                                  attention_mask=attention_mask,
                                                  past_key_values=None, position_ids=position_ids)
-    step = StepState(rowmap, batch, seq_len, cos[0].contiguous(), sin[0].contiguous(), segments)
+    step = StepState(rowmap, batch, seq_len, cos[0].contiguous(), sin[0].contiguous(), segments,
+                     plan.workspace)
 
     delta = torch.zeros((tokens, hidden), dtype=torch.float16, device=dev)
     ones = plan.dropout_input((batch, seq_len, hidden), dev)

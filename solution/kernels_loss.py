@@ -21,7 +21,7 @@ import triton
 import triton.language as tl
 
 IGNORE_INDEX = -100
-CHUNK = 256
+CHUNK = 128
 VOCAB_BLOCK = 4096
 
 

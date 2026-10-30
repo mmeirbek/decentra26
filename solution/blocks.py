@@ -96,8 +96,9 @@ class LayerPlan:
 class StepState:
     """Per-forward facts shared by every layer."""
 
-    def __init__(self, rowmap, batch, seq_len, cos, sin, segments):
+    def __init__(self, rowmap, batch, seq_len, cos, sin, segments, workspace=None):
         dev = rowmap.device
+        self.workspace = workspace  # fp16 buffer every weight dequant of the step writes
         self.rowmap, self.batch, self.seq_len = rowmap, batch, seq_len
         self.segments = segments  # [(start, stop)] of each row's tokens, or None
         self.cos, self.sin = cos, sin
@@ -151,6 +152,12 @@ def _norm_backward(dx, xhat, rstd, weight, dres_out, step, bits_q=None, bits_v=N
     return dres, ddelta
 
 
+def _unpack_bits(bits, hidden):
+    """(tokens, hidden // 8) uint8 -> (tokens, hidden) bool, entry 8 * j + b from bit b of byte j."""
+    shifts = torch.arange(8, dtype=torch.uint8, device=bits.device)
+    return ((bits.unsqueeze(-1) >> shifts) & 1).view(bits.shape[0], hidden).bool()
+
+
 def _no_autocast(tensor):
     """Our matmuls already get the fp16 operands autocast would make; keep autocast out of them
     (and out of the `out=` matmuls it does not handle)."""
@@ -180,7 +187,7 @@ class AttnPrologue(torch.autograd.Function):
         n = _norm_launch(res, delta, plan.ln_in.weight, plan.ln_in.variance_epsilon, step, keep_q,
                          keep_v, drop_scale)
         xq, xv = n.xq, n.xv
-        w = dequant_rows(plan.qkv, HALF, dev)
+        w = dequant_rows(plan.qkv, HALF, dev, step.workspace)
         qkv = torch.addmm(plan.qkv_bias, n.x, w.t())
         del w
         lora_aq = xq @ aq.to(HALF).t()
@@ -195,14 +202,14 @@ class AttnPrologue(torch.autograd.Function):
             qkv, lora_q, lora_v, step.cos, step.sin, step.rowmap, q, k, v,
             plan.lora_q.scaling, plan.lora_v.scaling, step.seq_len,
             NQ=plan.n_heads, NKV=plan.n_kv, D=plan.head_dim, num_warps=1)
-        ctx.save_for_backward(n.xhat, n.rstd, xq, xv, lora_aq, lora_av, n.bits_q, n.bits_v,
-                              drop_scale, aq, bq, av, bv)
+        ctx.save_for_backward(n.xhat, n.rstd, lora_aq, lora_av, n.bits_q, n.bits_v, drop_scale,
+                              aq, bq, av, bv)
         ctx.plan, ctx.step = plan, step
         return n.h, q, k, v
 
     @staticmethod
     def backward(ctx, dh, dq, dk, dv):
-        xhat, rstd, xq, xv, lora_aq, lora_av, bits_q, bits_v, drop_scale, aq, bq, av, bv = \
+        xhat, rstd, lora_aq, lora_av, bits_q, bits_v, drop_scale, aq, bq, av, bv = \
             ctx.saved_tensors
         plan, step = ctx.plan, ctx.step
         tokens, hidden = xhat.shape
@@ -218,10 +225,14 @@ class AttnPrologue(torch.autograd.Function):
             dq, dk, dv, step.cos, step.sin,
             step.rowmap, dqkv, dlora_q, dlora_v, plan.lora_q.scaling, plan.lora_v.scaling,
             step.seq_len, NQ=plan.n_heads, NKV=plan.n_kv, D=plan.head_dim, num_warps=1)
-        w = dequant_rows(plan.qkv, HALF, dev)
+        w = dequant_rows(plan.qkv, HALF, dev, step.workspace)
         dx = dqkv @ w
         del w, dqkv
         aq16, bq16, av16, bv16 = (t.to(HALF) for t in (aq, bq, av, bv))
+        y = xhat.float() * plan.ln_in.weight  # the LoRA inputs, rebuilt as the forward made them
+        xq = torch.where(_unpack_bits(bits_q, hidden), y * drop_scale, 0.0).to(HALF)
+        xv = torch.where(_unpack_bits(bits_v, hidden), y * drop_scale, 0.0).to(HALF)
+        del y
         d_bq = (dlora_q.t() @ lora_aq).float()
         d_lora_aq = dlora_q @ bq16
         d_aq = (d_lora_aq.t() @ xq).float()
@@ -251,51 +262,57 @@ class PostBlock(torch.autograd.Function):
     @staticmethod
     def _forward(ctx, res, attn, plan, step):
         dev = res.device
-        w = dequant_rows(plan.o, HALF, dev)
+        w = dequant_rows(plan.o, HALF, dev, step.workspace)
         o = attn @ w.t()
         del w
         n = _norm_launch(res, o, plan.ln_post.weight, plan.ln_post.variance_epsilon, step)
         del o
-        w = dequant_rows(plan.gate_up, HALF, dev)
+        w = dequant_rows(plan.gate_up, HALF, dev, step.workspace)
         gu = n.x @ w.t()
         del w
         act = torch.empty((res.shape[0], plan.inter), dtype=HALF, device=dev)
         gated_act_kernel[(res.shape[0], triton.cdiv(plan.inter, ACT_BLOCK_FWD))](
             gu, act, I=plan.inter, BLOCK=ACT_BLOCK_FWD, BACKWARD=False, num_warps=ACT_WARPS)
-        w = dequant_rows(plan.down, HALF, dev)
+        w = dequant_rows(plan.down, HALF, dev, step.workspace)
         out = act @ w.t()
         del w, act
-        ctx.save_for_backward(n.xhat, n.rstd, n.x if plan.recompute_mlp else gu)
+        if plan.recompute_mlp:
+            ctx.save_for_backward(n.xhat, n.rstd)
+        else:
+            ctx.save_for_backward(n.xhat, n.rstd, gu)
         ctx.plan, ctx.step = plan, step
         return n.h, out
 
     @staticmethod
     def backward(ctx, dh, dout):
-        xhat, rstd, kept = ctx.saved_tensors
+        xhat, rstd, *kept = ctx.saved_tensors
+        kept = kept[0] if kept else None
         plan, step = ctx.plan, ctx.step
         dev = xhat.device
         tokens, hidden = xhat.shape
         dout = _zeros_if_none(dout, xhat, (tokens, hidden), HALF)
-        w = dequant_rows(plan.down, HALF, dev)
+        w = dequant_rows(plan.down, HALF, dev, step.workspace)
         dact = dout @ w
         del w
         w_gu = None
-        if plan.recompute_mlp:
-            w_gu = dequant_rows(plan.gate_up, HALF, dev)
-            gu = kept @ w_gu.t()
+        if plan.recompute_mlp:  # gate|up again from the MLP input, rebuilt from xhat as in forward
+            w_gu = dequant_rows(plan.gate_up, HALF, dev, step.workspace)
+            x = (xhat.float() * plan.ln_post.weight).to(HALF)
+            gu = x @ w_gu.t()
+            del x
         else:
             gu = kept
         gated_act_kernel[(tokens, triton.cdiv(plan.inter, ACT_BLOCK_BWD))](
             gu, dact, I=plan.inter, BLOCK=ACT_BLOCK_BWD, BACKWARD=True, num_warps=ACT_WARPS)
         del dact
         if w_gu is None:
-            w_gu = dequant_rows(plan.gate_up, HALF, dev)
+            w_gu = dequant_rows(plan.gate_up, HALF, dev, step.workspace)
         dx = gu @ w_gu
         del w_gu, gu
         dres, do = _norm_backward(dx, xhat, rstd, plan.ln_post.weight,
                                   _zeros_if_none(dh, xhat, (tokens, hidden), torch.float32), step)
         del dx
-        w = dequant_rows(plan.o, HALF, dev)
+        w = dequant_rows(plan.o, HALF, dev, step.workspace)
         dattn = do @ w
         del w, do
         return dres, dattn, None, None

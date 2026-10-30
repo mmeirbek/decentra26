@@ -76,11 +76,17 @@ class NF4Weight:
         return out
 
 
-def dequant_rows(weights, dtype, device):
+def dequant_rows(weights, dtype, device, workspace=None):
     """Several weights with the same in_features, stacked by rows into one dense tensor (one
-    matmul then serves all of them)."""
+    matmul then serves all of them). With `workspace`, the result is a view of it: every dequant
+    of a step writes the same buffer, which the matmul reading it has finished with by then (one
+    CUDA stream), so the allocator never sees these 5-55 MB temporaries."""
     rows = sum(w.shape[0] for w in weights)
-    out = torch.empty((rows, weights[0].shape[1]), dtype=dtype, device=device)
+    cols = weights[0].shape[1]
+    if workspace is not None:
+        out = workspace[:rows * cols].view(rows, cols)
+    else:
+        out = torch.empty((rows, cols), dtype=dtype, device=device)
     start = 0
     for w in weights:
         w.dequant(out[start:start + w.shape[0]])
