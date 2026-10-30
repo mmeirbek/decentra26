@@ -23,10 +23,13 @@ KIT = "https://github.com/MakazhanAlpamys/soup-kernel-challenge.git"
 KIT_COMMIT = "c7c2fcd"
 
 
-def solution_archive(replace=()):
-    """solution/ as a base64 tar.gz; `replace` holds (file, old, new) source edits for experiments."""
+def solution_archive(replace=(), extra=()):
+    """solution/ as a base64 tar.gz; `replace` holds (file, old, new) source edits and `extra`
+    (archive name, source path) files added for experiments."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, source in extra:
+            tar.add(source, arcname=name)
         for path in sorted((REPO / "solution").rglob("*")):
             if not path.is_file() or "__pycache__" in path.parts:
                 continue
@@ -48,10 +51,11 @@ def code(*lines):
             "source": [line + "\n" for line in lines]}
 
 
-def notebook(archive, repeats, profile):
+def notebook(archive, repeats, profile, only_solution=False):
     template = json.loads((REPO / "templates" / "kaggle_notebook.ipynb").read_text())
     install = [c for c in template["cells"] if c["cell_type"] == "code"][1]  # GPU check + pip
-    run_args = f"--repeats {repeats}" + (" --profile" if profile else "")
+    run_args = f"--repeats {repeats}" + (" --profile" if profile else "") + \
+        (" --only solution" if only_solution else "")
     cells = [
         install,
         code("import base64, io, shutil, subprocess, tarfile",
@@ -112,6 +116,10 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--no-recompute-mlp", action="store_true",
                         help="experiment: run with model.RECOMPUTE_MLP = False")
+    parser.add_argument("--only-solution", action="store_true",
+                        help="train only the solution (quicker; the checks that need the base fail)")
+    parser.add_argument("--probe-first-step", action="store_true",
+                        help="experiment: time the first training steps (dev/first_step_probe.py)")
     parser.add_argument("--out", default=str(REPO / "runs_kaggle" / "build"))
     args = parser.parse_args()
     out = Path(args.out)
@@ -119,8 +127,14 @@ def main():
     replace = []
     if args.no_recompute_mlp:
         replace.append(("solution/model.py", "RECOMPUTE_MLP = True", "RECOMPUTE_MLP = False"))
-    (out / "notebook.ipynb").write_text(json.dumps(notebook(solution_archive(replace),
-                                                            args.repeats, args.profile), indent=1))
+    extra = []
+    if args.probe_first_step:
+        extra.append(("solution/_probe.py", REPO / "dev" / "first_step_probe.py"))
+        replace.append(("solution/__init__.py", "    patch_soup_wrapper()\n",
+                        "    patch_soup_wrapper()\n    from . import _probe\n    _probe.install()\n"))
+    (out / "notebook.ipynb").write_text(json.dumps(notebook(solution_archive(replace, extra),
+                                                            args.repeats, args.profile,
+                                                            args.only_solution), indent=1))
     meta = {"id": f"{args.user}/{args.slug}", "title": args.slug, "code_file": "notebook.ipynb",
             "language": "python", "kernel_type": "notebook", "is_private": True,
             "enable_gpu": True, "enable_internet": True, "dataset_sources": [],
