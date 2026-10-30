@@ -3,8 +3,9 @@
 `install_plan(model)` runs once Soup has built the 4-bit PEFT model. It checks that the model is
 the case this path is written for (Qwen2, NF4 with nested scales, fp16 compute, LoRA on q_proj and
 v_proj, SDPA) and attaches a `ModelPlan`. Anything else keeps Soup's own path. The plan is active
-only while Soup trains (trainer.py); then the tied embedding / output head is stored in fp16 (its
-values came from an fp16 checkpoint, so nothing changes) and restored afterwards.
+only while Soup trains (trainer.py). The tied embedding / output head stays in fp16 as loaded
+(`fp16_embedding_to_keep`; its values came from an fp16 checkpoint, so nothing changes), and if
+peft widened it anyway, it is narrowed for training and restored afterwards.
 
 `fused_forward` replaces Qwen2ForCausalLM.forward for training steps with labels:
   - pad positions are dropped right away (`rowmap` = flat indices of the real tokens); attention
@@ -68,10 +69,10 @@ class ModelPlan:
         self._drop_scale = {}
 
     def activate(self):
-        """For the training run: the tied embedding / output head is stored in fp16. Its values are
-        fp16 numbers (the checkpoint loads in fp16 on a T4; peft only widened them), so this frees
-        half of it and the per-step fp16 copy autocast made for the output head, and changes no
-        value."""
+        """For the training run: the tied embedding / output head is stored in fp16 (usually it
+        already is, see `fp16_embedding_to_keep`). Its values are fp16 numbers (the checkpoint
+        loads in fp16 on a T4; peft only widens them), so this frees half of it and the per-step
+        fp16 copy autocast made for the output head, and changes no value."""
         weight = self.embed.weight
         if weight.dtype != torch.float16:
             self._embed_dtype = weight.dtype
@@ -111,6 +112,29 @@ class ModelPlan:
         return keep, self._drop_scale[p]
 
 
+def fp16_embedding_to_keep(model):
+    """The tied embedding / output head weight of a 4-bit Qwen2ForCausalLM that is still fp16 as
+    loaded, else None. peft.prepare_model_for_kbit_training widens it to fp32: 890 MB next to the
+    445 MB it copies, the largest moment of the whole run on a T4, to hold the same fp16 values that
+    the fused path reads. trainer.patch_kbit_preparation keeps this one as loaded; should the
+    fused path not take the model after all, install_plan widens it as peft would have."""
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
+
+    if not isinstance(model, Qwen2ForCausalLM) or not getattr(model, "is_loaded_in_4bit", False):
+        return None
+    weight = model.model.embed_tokens.weight
+    if model.lm_head.weight is not weight or weight.dtype != torch.float16:
+        return None
+    return weight
+
+
+def _widen_kept_embedding(causal_lm):
+    """Soup's own path runs after all: the embedding gets the fp32 that peft would have given it."""
+    if causal_lm.__dict__.pop("_soupk_fp16_embedding", False):
+        weight = causal_lm.model.embed_tokens.weight
+        weight.data = weight.data.to(torch.float32)
+
+
 def install_plan(peft_model, recompute_mlp=None, require_cuda=True):
     """Attach the fused path to the Qwen2 inside `peft_model`; returns the plan, or None (with the
     reason printed) when the model is not the case it is written for."""
@@ -128,6 +152,7 @@ def install_plan(peft_model, recompute_mlp=None, require_cuda=True):
         plan = ModelPlan(causal_lm, RECOMPUTE_MLP if recompute_mlp is None else recompute_mlp)
     except (ValueError, AttributeError, KeyError) as exc:
         print(f"[solution] fused path off, Soup's own path runs: {exc}", flush=True)
+        _widen_kept_embedding(causal_lm)
         return None
     causal_lm.__dict__["_soupk_plan"] = plan
     print(f"[solution] fused path on: {len(plan.layers)} layers, packed tokens, fused loss",

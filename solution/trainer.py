@@ -1,5 +1,8 @@
 """Hooks into Soup and TRL around the fused model forward.
 
+- `peft.prepare_model_for_kbit_training` (Soup calls it while building the model): for the
+  model the fused path is written for, the tied embedding / output head stays fp16 as loaded
+  instead of being widened to fp32 (model.fp16_embedding_to_keep).
 - `SFTTrainerWrapper._setup_transformers`: after it, the model is the final 4-bit PEFT model, so
   the fused plan is attached (model.install_plan).
 - `SFTTrainerWrapper.train`: the plan is active (fp16 embedding, fused forward) only while Soup
@@ -14,7 +17,7 @@
 
 import torch
 
-from .model import install_plan, labels_only_on_real_tokens, plan_of
+from .model import fp16_embedding_to_keep, install_plan, labels_only_on_real_tokens, plan_of
 
 try:
     from soup_cli.utils.stream_loss_chunk import STEP_ATTR
@@ -83,6 +86,27 @@ def patch_trl_compute_loss():
         return compute_loss
 
     _patch(SFTTrainer, "compute_loss", make)
+
+
+def patch_kbit_preparation():
+    import peft
+
+    def make(original):
+        def prepare_model_for_kbit_training(model, *args, **kwargs):
+            weight = fp16_embedding_to_keep(model)
+            if weight is None:
+                return original(model, *args, **kwargs)
+            loaded = weight.data
+            weight.data = loaded.new_empty(0, dtype=torch.float32)  # not fp16: peft leaves it be
+            try:
+                return original(model, *args, **kwargs)
+            finally:
+                weight.data = loaded
+                model.__dict__["_soupk_fp16_embedding"] = True
+
+        return prepare_model_for_kbit_training
+
+    _patch(peft, "prepare_model_for_kbit_training", make)
 
 
 def patch_soup_wrapper():

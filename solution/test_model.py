@@ -22,9 +22,9 @@ else:
 from solution.model import install_plan, patch_qwen2, row_segments  # noqa: E402
 
 
-def tiny_qlora_model(lora_dropout=0.0):
+def tiny_4bit_model():
+    """As from_pretrained leaves it: NF4 linears, everything else fp16."""
     import bitsandbytes as bnb
-    from peft import LoraConfig, get_peft_model
     from transformers import Qwen2Config, Qwen2ForCausalLM
 
     torch.manual_seed(0)
@@ -49,6 +49,13 @@ def tiny_qlora_model(lora_dropout=0.0):
                 setattr(parent, name, q.to(DEV))
     model.to(DEV)
     model.is_loaded_in_4bit = True  # as from_pretrained marks it: peft then wraps with its bnb LoRA
+    return model
+
+
+def tiny_qlora_model(lora_dropout=0.0):
+    from peft import LoraConfig, get_peft_model
+
+    model = tiny_4bit_model()
     for param in model.parameters():  # what prepare_model_for_kbit_training does
         param.requires_grad = False
         if param.dtype == torch.float16 and param.__class__.__name__ != "Params4bit":
@@ -174,6 +181,26 @@ def test_embedding_is_restored_bit_for_bit_after_training():
     assert plan.embed.weight.dtype == torch.float16
     plan.deactivate()
     assert plan.embed.weight.dtype == before.dtype and torch.equal(plan.embed.weight, before)
+
+
+def test_kbit_preparation_keeps_the_tied_embedding_as_loaded():
+    import peft
+    from solution.trainer import patch_kbit_preparation
+
+    patch_kbit_preparation()
+    widened = tiny_qlora_model().get_base_model().model.embed_tokens.weight
+    model = tiny_4bit_model()
+    weight = model.model.embed_tokens.weight
+    storage = weight.data_ptr()
+    model = peft.prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+    assert weight.dtype == torch.float16 and weight.data_ptr() == storage  # not even copied
+    assert torch.equal(weight.float(), widened)  # the values peft's fp32 copy holds
+    assert model.model.norm.weight.dtype == torch.float32  # everything else as peft makes it
+    assert not any(p.requires_grad for p in model.parameters())
+
+    model.config.hidden_act = "gelu"  # a model the fused path does not take: Soup's own path
+    assert install_plan(model, require_cuda=False) is None  # gets the embedding peft would give
+    assert weight.dtype == torch.float32 and torch.equal(weight, widened)
 
 
 def test_row_segments():
