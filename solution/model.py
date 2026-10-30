@@ -20,7 +20,7 @@ values came from an fp16 checkpoint, so nothing changes) and restored afterwards
 import torch
 
 from .blocks import AttnPrologue, FinalNorm, LayerPlan, PostBlock, StepState, attend
-from .kernels_loss import IGNORE_INDEX, FusedLMLoss, loss_scale_of
+from .kernels_loss import IGNORE_INDEX, FusedLMLoss, labelled_first, loss_scale_of
 from . import warmup
 
 RECOMPUTE_MLP = True  # keep no MLP activations and redo gate|up in backward: on a T4 about -1.1 GB
@@ -195,6 +195,7 @@ def fused_forward(model, plan, input_ids, attention_mask, labels, num_items_in_b
     res = torch.nn.functional.embedding(ids, plan.embed.weight).float()
     targets = torch.nn.functional.pad(labels, (0, 1), value=IGNORE_INDEX)[:, 1:]
     targets = targets.reshape(-1).index_select(0, rowmap)
+    order, n_labelled = labelled_first(targets)  # synchronizes here, while the GPU is idle anyway
 
     # What Qwen2Model.forward builds, from the padded batch: positions and RoPE tables; the padded
     # mask only when some row's tokens are not contiguous (then attention runs padded, as the base).
@@ -228,7 +229,8 @@ def fused_forward(model, plan, input_ids, attention_mask, labels, num_items_in_b
     else:
         denominator = num_items_in_batch
     loss, token_loss, entropy, hit = FusedLMLoss.apply(x, plan.embed.weight, targets, denominator,
-                                                       loss_scale_of(plan.scaler, dev))
+                                                       loss_scale_of(plan.scaler, dev), order,
+                                                       n_labelled)
     padded_loss = torch.zeros(batch * seq_len, dtype=torch.float32, device=dev)
     padded_loss.index_copy_(0, rowmap, token_loss)
     plan.last_step = TokenStats(padded_loss.view(batch, seq_len), entropy.sum(), hit.sum(),

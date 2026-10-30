@@ -65,7 +65,9 @@ def test_fused_loss_matches_cross_entropy_entropy_accuracy_and_grad(monkeypatch,
     targets[::4] = -100
     denom = (targets != -100).sum()
     scale = torch.tensor([1024.0], device=DEV)
-    loss, token_loss, entropy, hit = kernels_loss.FusedLMLoss.apply(h, w, targets, denom, scale)
+    order, n_labelled = kernels_loss.labelled_first(targets)
+    loss, token_loss, entropy, hit = kernels_loss.FusedLMLoss.apply(h, w, targets, denom, scale,
+                                                                    order, n_labelled)
     (loss * scale).sum().backward()
 
     logits = (h.detach() @ w.t()).float()

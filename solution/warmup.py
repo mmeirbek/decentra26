@@ -94,10 +94,11 @@ def _compile_all(config):
             ready(gated_act_kernel.warmup(t(f16), t(f16), I=config.intermediate_size,
                                           BLOCK=act_block, BACKWARD=backward, num_warps=ACT_WARPS,
                                           grid=grid))
-        ready(lm_loss_kernel.warmup(t(f16), t(i64), t(f32), t(f32), t(f32), t(torch.int32), vocab,
-                                    V=vocab, BLOCK=VOCAB_BLOCK, WITH_GRAD=True, num_warps=8,
-                                    grid=grid))
-        print(f"[solution] background compile of 11 kernel variants took "
+        for with_grad in (True, False):
+            ready(lm_loss_kernel.warmup(t(f16), t(i64), t(f32), t(f32), t(f32), t(torch.int32),
+                                        vocab, V=vocab, BLOCK=VOCAB_BLOCK, WITH_GRAD=with_grad,
+                                        num_warps=8, grid=grid))
+        print(f"[solution] background compile of 12 kernel variants took "
               f"{time.perf_counter() - started:.1f} s", flush=True)
     except Exception as exc:  # noqa: BLE001 - a failed warm-up only means compiling at first use
         print(f"[solution] background compile skipped: {exc!r}", flush=True)

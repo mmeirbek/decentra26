@@ -85,39 +85,51 @@ def loss_scale_of(scaler, device):
 class FusedLMLoss(torch.autograd.Function):
     """sum over labelled tokens of cross-entropy(hidden @ weight.T, target) / denominator.
 
-    Also returns, without gradients, each token's cross-entropy, entropy and argmax hit.
+    Also returns, without gradients, each token's cross-entropy, entropy and argmax hit (TRL's
+    entropy covers every real token, so every token's logits are built). Only labelled tokens
+    have a gradient: tokens go labelled first (`order`, `n_labelled` from the caller), the second
+    pass of the kernel and the gradient matmul run on those only, and the rest get exact zeros as
+    before, without the work.
     """
 
     @staticmethod
-    def forward(ctx, hidden, weight, targets, denominator, loss_scale):
+    def forward(ctx, hidden, weight, targets, denominator, loss_scale, order, n_labelled):
         with torch.autocast(device_type=hidden.device.type, enabled=False):
-            return FusedLMLoss._forward(ctx, hidden, weight, targets, denominator, loss_scale)
+            return FusedLMLoss._forward(ctx, hidden, weight, targets, denominator, loss_scale,
+                                        order, n_labelled)
 
     @staticmethod
-    def _forward(ctx, hidden, weight, targets, denominator, loss_scale):
+    def _forward(ctx, hidden, weight, targets, denominator, loss_scale, order, n_labelled):
         n_tokens, vocab = hidden.shape[0], weight.shape[0]
+        dev = hidden.device
         with_grad = hidden.requires_grad
-        token_loss = torch.empty(n_tokens, dtype=torch.float32, device=hidden.device)
+        hidden = hidden.index_select(0, order)
+        targets = targets.index_select(0, order)
+        token_loss = torch.empty(n_tokens, dtype=torch.float32, device=dev)
         entropy = torch.empty_like(token_loss)
-        hit = torch.empty(n_tokens, dtype=torch.int32, device=hidden.device)
-        grad_hidden = torch.empty((-(-n_tokens // 128) * 128, hidden.shape[1]), dtype=hidden.dtype,
-                                  device=hidden.device)[:n_tokens] if with_grad else None
+        hit = torch.empty(n_tokens, dtype=torch.int32, device=dev)
+        grad = torch.zeros_like(hidden) if with_grad else None
         gscale = (loss_scale / denominator).to(torch.float32)
-        logits = torch.empty((min(CHUNK, n_tokens), vocab), dtype=hidden.dtype, device=hidden.device)
+        logits = torch.empty((min(CHUNK, n_tokens), vocab), dtype=hidden.dtype, device=dev)
         for start in range(0, n_tokens, CHUNK):
             stop = min(start + CHUNK, n_tokens)
+            labelled_stop = min(stop, n_labelled) if with_grad else start
             chunk_logits = logits[:stop - start]
             torch.mm(hidden[start:stop], weight.t(), out=chunk_logits)
             lm_loss_kernel[(stop - start,)](
                 chunk_logits, targets[start:stop], gscale, token_loss[start:stop],
                 entropy[start:stop], hit[start:stop], vocab, V=vocab, BLOCK=VOCAB_BLOCK,
-                WITH_GRAD=with_grad, num_warps=8)
-            if with_grad:
-                torch.mm(chunk_logits, weight, out=grad_hidden[start:stop])
-        del logits
+                WITH_GRAD=labelled_stop > start, num_warps=8)
+            if labelled_stop > start:
+                torch.mm(chunk_logits[:labelled_stop - start], weight,
+                         out=grad[start:labelled_stop])
+        del logits, hidden
+        back = torch.empty_like(order)
+        back[order] = torch.arange(n_tokens, device=dev)
+        token_loss, entropy, hit = (t.index_select(0, back) for t in (token_loss, entropy, hit))
         loss = token_loss.sum() / denominator
         if with_grad:
-            ctx.save_for_backward(grad_hidden, loss_scale)
+            ctx.save_for_backward(grad.index_select(0, back), loss_scale)
         ctx.mark_non_differentiable(token_loss, entropy, hit)
         return loss, token_loss, entropy, hit
 
@@ -127,4 +139,11 @@ class FusedLMLoss(torch.autograd.Function):
         # grad_hidden already carries the loss scale it was rounded at; grad_loss is that scale
         # (the GradScaler's), so the ratio is exactly 1 and the multiply changes nothing.
         ratio = (grad_loss.reshape(1).float() / loss_scale).to(grad_hidden.dtype)
-        return grad_hidden * ratio, None, None, None, None
+        return grad_hidden * ratio, None, None, None, None, None, None
+
+
+def labelled_first(targets):
+    """A stable order with the labelled tokens first, and how many there are (one host sync)."""
+    unlabelled = (targets == IGNORE_INDEX).to(torch.int8)
+    order = torch.argsort(unlabelled, stable=True)
+    return order, int(targets.numel() - unlabelled.sum())
