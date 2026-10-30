@@ -221,3 +221,36 @@ def test_dropout_mask_is_the_one_torch_dropout_draws():
     assert torch.equal(torch.cuda.get_rng_state(), state_ref)
     scale = out.amax()
     assert torch.equal(ref, torch.where(keep, x * scale, torch.zeros_like(x)))
+
+
+@pytest.mark.skipif(DEV != "cuda", reason="the memory-efficient attention kernel is CUDA only")
+def test_packed_causal_attention_matches_sdpa_per_row():
+    from solution.blocks import PackedCausalAttention, repeat_kv
+
+    torch.manual_seed(7)
+    lengths, nq, nkv, d = [37, 5, 20, 1], 12, 2, 128
+    tokens = sum(lengths)
+    q = torch.randn(tokens, nq, d, device="cuda").half().requires_grad_()
+    k = torch.randn(tokens, nkv, d, device="cuda").half().requires_grad_()
+    v = torch.randn(tokens, nkv, d, device="cuda").half().requires_grad_()
+    bounds = torch.tensor([0] + list(torch.tensor(lengths).cumsum(0)), dtype=torch.int32,
+                          device="cuda")
+    scale = d ** -0.5
+    out = PackedCausalAttention.apply(q, k, v, bounds, max(lengths), scale)
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    got = (q.grad, k.grad, v.grad)
+    q.grad = k.grad = v.grad = None
+
+    refs = []
+    for start, stop in zip(bounds[:-1].tolist(), bounds[1:].tolist()):
+        qi = q[start:stop].unsqueeze(0).transpose(1, 2)
+        ki = repeat_kv(k[start:stop].unsqueeze(0).transpose(1, 2), nq // nkv)
+        vi = repeat_kv(v[start:stop].unsqueeze(0).transpose(1, 2), nq // nkv)
+        oi = F.scaled_dot_product_attention(qi, ki, vi, is_causal=stop - start > 1, scale=scale)
+        refs.append(oi.transpose(1, 2).squeeze(0))
+    ref = torch.cat(refs)
+    ref.backward(grad)
+    close(out, ref, 2e-3)
+    for mine, theirs in zip(got, (q.grad, k.grad, v.grad)):
+        close(mine, theirs, 5e-3)

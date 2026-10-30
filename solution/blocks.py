@@ -99,6 +99,11 @@ class StepState:
     def __init__(self, rowmap, batch, seq_len, cos, sin, segments, workspace=None):
         dev = rowmap.device
         self.workspace = workspace  # fp16 buffer every weight dequant of the step writes
+        self.cu_seqlens = self.max_seqlen = None
+        if segments is not None:  # each row's [start, stop) in packed order, for varlen attention
+            bounds = [0] + [stop for _, stop in segments]
+            self.cu_seqlens = torch.tensor(bounds, dtype=torch.int32).to(dev, non_blocking=True)
+            self.max_seqlen = max(stop - start for start, stop in segments)
         self.rowmap, self.batch, self.seq_len = rowmap, batch, seq_len
         self.segments = segments  # [(start, stop)] of each row's tokens, or None
         self.cos, self.sin = cos, sin
@@ -326,6 +331,10 @@ def attend(lp, q, k, v, step, attention_fn, mask):
     same softmax as the base's padded call with its mask, without the pad positions' work. Other
     masks take the padded call itself."""
     tokens = q.shape[0]
+    if step.segments is not None and q.is_cuda:
+        out = PackedCausalAttention.apply(q, k, v, step.cu_seqlens, step.max_seqlen,
+                                          lp.attn.scaling)
+        return out.view(tokens, -1)
     if step.segments is not None:
         outs = []
         for start, stop in step.segments:
@@ -348,6 +357,48 @@ def attend(lp, q, k, v, step, attention_fn, mask):
                           v_pad.view(*shape, *v.shape[1:]).transpose(1, 2), mask, dropout=0.0,
                           scaling=lp.attn.scaling, sliding_window=lp.attn.sliding_window)
     return out.reshape(slots, -1).index_select(0, step.rowmap).view(tokens, -1)
+
+
+class PackedCausalAttention(torch.autograd.Function):
+    """Causal attention over the packed rows of a batch in one call of the same memory-efficient
+    kernel SDPA picks on a T4, given each row's span (cu_seqlens) instead of a padded mask.
+
+    The kernel needs as many key/value heads as query heads, so k and v are repeated for each call
+    (forward, and again in backward) but kept for backward with their 2 heads: 5 MB less per layer
+    per 1,000 tokens than SDPA, which keeps the repeated ones."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, cu_seqlens, max_seqlen, scale):
+        groups = q.shape[1] // k.shape[1]
+        out, lse, seed, offset, _, _ = torch.ops.aten._efficient_attention_forward(
+            q.unsqueeze(0), _repeat_heads(k, groups).unsqueeze(0),
+            _repeat_heads(v, groups).unsqueeze(0), None, cu_seqlens, cu_seqlens, max_seqlen,
+            max_seqlen, 0.0, 1, True, scale=scale)  # 1: causal from the top left of each row
+        ctx.save_for_backward(q, k, v, out, lse, seed, offset, cu_seqlens)
+        ctx.max_seqlen, ctx.scale, ctx.groups = max_seqlen, scale, groups
+        return out.squeeze(0)
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v, out, lse, seed, offset, cu_seqlens = ctx.saved_tensors
+        groups, kv_heads = ctx.groups, k.shape[1]
+        dq, dk, dv, _ = torch.ops.aten._efficient_attention_backward(
+            dout.unsqueeze(0).contiguous(), q.unsqueeze(0), _repeat_heads(k, groups).unsqueeze(0),
+            _repeat_heads(v, groups).unsqueeze(0), None, out, cu_seqlens, cu_seqlens,
+            ctx.max_seqlen, ctx.max_seqlen, lse, 0.0, seed, offset, 1, False, scale=ctx.scale)
+        tokens, dim = q.shape[0], q.shape[2]
+        dk = dk.view(tokens, kv_heads, groups, dim).sum(2)  # as repeat_kv's backward sums
+        dv = dv.view(tokens, kv_heads, groups, dim).sum(2)
+        return dq.squeeze(0), dk, dv, None, None, None
+
+
+def _repeat_heads(x, groups):
+    """(tokens, kv_heads, d) -> (tokens, kv_heads * groups, d), kv head j // groups for head j, as
+    transformers' repeat_kv."""
+    if groups == 1:
+        return x
+    tokens, heads, dim = x.shape
+    return x[:, :, None].expand(tokens, heads, groups, dim).reshape(tokens, heads * groups, dim)
 
 
 def repeat_kv(x, groups):
