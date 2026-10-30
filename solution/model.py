@@ -59,6 +59,7 @@ class ModelPlan:
         self.scaler = None
         self.last_step = None
         self.active = False
+        self.fused_steps = 0
         self._ones = None
         self._drop_scale = {}
 
@@ -75,6 +76,8 @@ class ModelPlan:
 
     def deactivate(self):
         """After training: the embedding goes back to the dtype Soup gave it, value for value."""
+        if self.active:
+            print(f"[solution] fused forward ran for {self.fused_steps} training steps", flush=True)
         self.active = False
         dtype = getattr(self, "_embed_dtype", None)
         if dtype is not None:
@@ -148,6 +151,7 @@ def fused_forward(model, plan, input_ids, attention_mask, labels, num_items_in_b
     from transformers.models.qwen2 import modeling_qwen2
 
     warmup.wait()
+    plan.fused_steps += 1
     dev = input_ids.device
     batch, seq_len = input_ids.shape
     hidden = plan.embed.weight.shape[1]

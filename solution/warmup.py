@@ -10,10 +10,12 @@ from disk, and nothing is cached across runs.
 """
 
 import threading
+import time
 
 import torch
 
 _thread = None
+_waited = False
 
 
 def start(config):
@@ -29,8 +31,14 @@ def start(config):
 
 
 def wait():
-    if _thread is not None:
-        _thread.join()
+    global _waited
+    if _thread is None or _waited:
+        return
+    started = time.perf_counter()
+    _thread.join()
+    _waited = True
+    print(f"[solution] first fused step waited {time.perf_counter() - started:.1f} s for the "
+          "background compile", flush=True)
 
 
 def _compile_all(config):
@@ -43,6 +51,7 @@ def _compile_all(config):
     from .kernels_nf4 import BYTES_PER_PROGRAM, nf4_dequant_kernel
     from .kernels_norm import add_rmsnorm_bwd_kernel, add_rmsnorm_fwd_kernel
 
+    started = time.perf_counter()
     try:
         dev = torch.device("cuda", torch.cuda.current_device())
 
@@ -75,5 +84,7 @@ def _compile_all(config):
                                     BACKWARD=backward, num_warps=4, grid=grid)
         lm_loss_kernel.warmup(t(f16), t(i64), t(f32), t(f32), t(f32), t(torch.int32), vocab,
                               V=vocab, BLOCK=VOCAB_BLOCK, WITH_GRAD=True, num_warps=8, grid=grid)
+        print(f"[solution] background compile of 10 kernel variants took "
+              f"{time.perf_counter() - started:.1f} s", flush=True)
     except Exception as exc:  # noqa: BLE001 - a failed warm-up only means compiling at first use
         print(f"[solution] background compile skipped: {exc!r}", flush=True)
