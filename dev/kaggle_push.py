@@ -23,12 +23,23 @@ KIT = "https://github.com/MakazhanAlpamys/soup-kernel-challenge.git"
 KIT_COMMIT = "c7c2fcd"
 
 
-def solution_archive():
+def solution_archive(replace=()):
+    """solution/ as a base64 tar.gz; `replace` holds (file, old, new) source edits for experiments."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for path in sorted((REPO / "solution").rglob("*")):
-            if path.is_file() and "__pycache__" not in path.parts:
-                tar.add(path, arcname=str(path.relative_to(REPO)))
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            name = str(path.relative_to(REPO))
+            data = path.read_bytes()
+            for file, old, new in replace:
+                if name == file:
+                    if old.encode() not in data:
+                        raise SystemExit(f"{old!r} not found in {file}")
+                    data = data.replace(old.encode(), new.encode())
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -88,12 +99,17 @@ def main():
     parser.add_argument("--slug", default="soup-kernel-dev")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--recompute-mlp", action="store_true",
+                        help="experiment: run with model.RECOMPUTE_MLP = True")
     parser.add_argument("--out", default=str(REPO / "runs_kaggle" / "build"))
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "notebook.ipynb").write_text(json.dumps(notebook(solution_archive(), args.repeats,
-                                                            args.profile), indent=1))
+    replace = []
+    if args.recompute_mlp:
+        replace.append(("solution/model.py", "RECOMPUTE_MLP = False", "RECOMPUTE_MLP = True"))
+    (out / "notebook.ipynb").write_text(json.dumps(notebook(solution_archive(replace),
+                                                            args.repeats, args.profile), indent=1))
     meta = {"id": f"{args.user}/{args.slug}", "title": args.slug, "code_file": "notebook.ipynb",
             "language": "python", "kernel_type": "notebook", "is_private": True,
             "enable_gpu": True, "enable_internet": True, "dataset_sources": [],
