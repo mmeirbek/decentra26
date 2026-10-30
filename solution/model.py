@@ -222,3 +222,12 @@ def patch_qwen2():
     forward._soupk = True
     forward.__wrapped__ = original
     Qwen2ForCausalLM.forward = forward
+
+    original_init = Qwen2ForCausalLM.__init__
+
+    def __init__(self, config, *args, **kwargs):
+        original_init(self, config, *args, **kwargs)
+        warmup.start(config)  # weights load after this: compile while they do
+
+    __init__.__wrapped__ = original_init
+    Qwen2ForCausalLM.__init__ = __init__

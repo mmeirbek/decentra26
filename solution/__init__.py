@@ -4,10 +4,11 @@ The harness imports this package and calls `apply()` once, in the same process a
 before Soup builds the model and the trainer. `apply()` installs three narrow patches; each one
 falls back to the original code unless it sees the real 4-bit Qwen2 PEFT model on CUDA:
 
-- `SFTTrainerWrapper._setup_transformers` and `.train`: start compiling our kernels in the
-  background while the model loads, attach the fused plan to the finished model and keep it active
-  only while Soup trains (solution/model.py);
-- `Qwen2ForCausalLM.forward`: training steps with labels run the fused forward;
+- `SFTTrainerWrapper._setup_transformers` and `.train`: attach the fused plan to the finished
+  model and keep it active only while Soup trains (solution/model.py);
+- `Qwen2ForCausalLM.forward` and `__init__`: training steps with labels run the fused forward; once
+  the module exists, our kernels compile in a background thread while its weights load
+  (solution/warmup.py);
 - `trl.SFTTrainer.compute_loss`: logs TRL's metrics and feeds Soup's rewind log from the fused
   step, since it returns no logits (solution/trainer.py).
 

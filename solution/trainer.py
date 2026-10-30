@@ -1,8 +1,7 @@
 """Hooks into Soup and TRL around the fused model forward.
 
-- `SFTTrainerWrapper._setup_transformers`: before it, start compiling our kernels in the background
-  (the model is about to load); after it, the model is the final 4-bit PEFT model, so the fused
-  plan is attached (model.install_plan).
+- `SFTTrainerWrapper._setup_transformers`: after it, the model is the final 4-bit PEFT model, so
+  the fused plan is attached (model.install_plan).
 - `SFTTrainerWrapper.train`: the plan is active (fp16 embedding, fused forward) only while Soup
   trains; afterwards the model is exactly what Soup built.
 - `trl.SFTTrainer.compute_loss`: when the fused path runs, the model returns the loss without
@@ -15,7 +14,6 @@
 
 import torch
 
-from . import warmup
 from .model import install_plan, plan_of
 
 try:
@@ -91,7 +89,6 @@ def patch_soup_wrapper():
 
     def make_setup(original):
         def _setup_transformers(self, cfg, tcfg):
-            warmup.start_for(getattr(cfg, "base", None))
             result = original(self, cfg, tcfg)
             model = getattr(self, "model", None)
             if isinstance(model, torch.nn.Module):

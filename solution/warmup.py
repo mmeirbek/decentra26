@@ -1,11 +1,12 @@
 """Compile our Triton kernels while Soup loads the model.
 
 Every measured run starts with empty compiler caches, so each kernel variant costs a compile (one to
-a few seconds on Kaggle's CPU) before its first launch. Loading and quantizing the model takes
-longer than all of them together, so the compiles run in a background thread from the moment Soup
-starts loading, with the model's own sizes read from its config in the local Hugging Face cache.
-The first fused forward waits for the thread. Nothing here launches a kernel on the GPU
-(`warmup=True` compiles only), and nothing is cached across runs.
+a few seconds on Kaggle's CPU) before its first launch. `from_pretrained` builds the Qwen2 module
+from its config first and then spends most of its time reading and quantizing the weights, so the
+compiles start in a background thread of this same process as soon as the module exists, with the
+sizes from that config (model.patch_qwen2 calls `start`). The first fused forward waits for the
+thread. Nothing here launches a kernel on the GPU (`warmup=True` compiles only), nothing is read
+from disk, and nothing is cached across runs.
 """
 
 import threading
@@ -15,16 +16,10 @@ import torch
 _thread = None
 
 
-def start_for(base):
-    """Start compiling for the model `base` names, if it is a Qwen2 model available offline."""
+def start(config):
+    """Start compiling for a Qwen2 config, once per process, when a GPU is there."""
     global _thread
-    if _thread is not None or not base or not torch.cuda.is_available():
-        return
-    try:
-        from transformers import AutoConfig
-
-        config = AutoConfig.from_pretrained(base, local_files_only=True)
-    except Exception:  # noqa: BLE001 - not cached or not a model: the first launches compile
+    if _thread is not None or not torch.cuda.is_available():
         return
     if getattr(config, "model_type", None) != "qwen2":
         return
