@@ -169,6 +169,8 @@ def main():
                         help="only run `pytest solution` on the GPU, with full tracebacks")
     parser.add_argument("--only-solution", action="store_true",
                         help="train only the solution (quicker; the checks that need the base fail)")
+    parser.add_argument("--probe-memory", action="store_true",
+                        help="experiment: what is alive at the peak, by allocating line")
     parser.add_argument("--tune", action="store_true",
                         help="experiment: time kernel block sizes on the T4 (dev/tune_probe.py)")
     parser.add_argument("--probe-first-step", action="store_true",
@@ -187,6 +189,10 @@ def main():
                         "    patch_soup_wrapper()\n    from . import _probe\n    _probe.install()\n"))
     if args.tune:
         extra.append(("solution/_tune.py", REPO / "dev" / "tune_probe.py"))
+    if args.probe_memory:
+        extra.append(("solution/_memprobe.py", REPO / "dev" / "memory_probe.py"))
+        replace.append(("solution/__init__.py", "    patch_soup_wrapper()\n",
+                        "    patch_soup_wrapper()\n    from . import _memprobe\n    _memprobe.install()\n"))
     if args.ab:
         import subprocess
         import tempfile
