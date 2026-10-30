@@ -85,3 +85,27 @@ def add_rmsnorm_bwd_kernel(dx_ptr, xhat_ptr, rstd_ptr, w_ptr, dres_out_ptr, dres
     dres = rstd * (dxhat - xhat * proj) + tl.load(dres_out_ptr + offs, mask=live, other=0.0)
     tl.store(dres_ptr + offs, dres, mask=live)
     tl.store(ddelta_ptr + offs, dres.to(tl.float16), mask=live)
+
+
+@triton.jit
+def lora_inputs_kernel(xhat_ptr, w_ptr, bits_q_ptr, bits_v_ptr, drop_scale_ptr, xq_ptr, xv_ptr,
+                       H: tl.constexpr, BLOCK: tl.constexpr):
+    """Backward's copy of the q_proj / v_proj LoRA inputs, x * mask * dropout_scale, from the kept
+    xhat and mask bits (the forward pass does not keep them)."""
+    tok = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    live = cols < H
+    offs = tok.to(tl.int64) * H + cols
+    y = tl.load(w_ptr + cols, mask=live, other=0.0) * \
+        tl.load(xhat_ptr + offs, mask=live, other=0.0).to(tl.float32)
+    bit = tl.arange(0, 8)[None, :]
+    byte_cols = tl.arange(0, BLOCK // 8)
+    byte_offs = tok.to(tl.int64) * (H // 8) + byte_cols
+    byte_live = byte_cols < H // 8
+    packed_q = tl.load(bits_q_ptr + byte_offs, mask=byte_live, other=0).to(tl.int32)
+    packed_v = tl.load(bits_v_ptr + byte_offs, mask=byte_live, other=0).to(tl.int32)
+    keep_q = tl.reshape((packed_q[:, None] >> bit) & 1, (BLOCK,)) != 0
+    keep_v = tl.reshape((packed_v[:, None] >> bit) & 1, (BLOCK,)) != 0
+    drop_scale = tl.load(drop_scale_ptr)
+    tl.store(xq_ptr + offs, tl.where(keep_q, y * drop_scale, 0.0).to(tl.float16), mask=live)
+    tl.store(xv_ptr + offs, tl.where(keep_v, y * drop_scale, 0.0).to(tl.float16), mask=live)

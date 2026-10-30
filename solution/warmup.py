@@ -51,7 +51,7 @@ def _compile_all(config):
     from .kernels_loss import VOCAB_BLOCK, lm_loss_kernel
     from .kernels_mlp import gated_act_kernel
     from .kernels_nf4 import NF4_WARPS, WORDS_PER_PROGRAM, nf4_dequant_kernel
-    from .kernels_norm import add_rmsnorm_bwd_kernel, add_rmsnorm_fwd_kernel
+    from .kernels_norm import add_rmsnorm_bwd_kernel, add_rmsnorm_fwd_kernel, lora_inputs_kernel
 
     started = time.perf_counter()
     try:
@@ -84,6 +84,8 @@ def _compile_all(config):
                 t(f16), t(f16), t(f32), t(f32), t(f32), t(f32), t(f16), t(u8), t(u8), t(f32),
                 t(f16), t(f16), H=hidden, BLOCK=block, WITH_LORA=with_lora, num_warps=8,
                 grid=grid))
+        ready(lora_inputs_kernel.warmup(t(f16), t(f32), t(u8), t(u8), t(f32), t(f16), t(f16),
+                                        H=hidden, BLOCK=block, num_warps=8, grid=grid))
         for kernel in (qkv_rope_fwd_kernel, qkv_rope_bwd_kernel):
             ready(kernel.warmup(t(f16), t(f16), t(f16), t(f32), t(f32), t(i64), t(f16), t(f16),
                                 t(f16), 2.0, 2.0, 512, NQ=n_q, NKV=n_kv, D=head_dim, num_warps=1,
@@ -95,7 +97,7 @@ def _compile_all(config):
         ready(lm_loss_kernel.warmup(t(f16), t(i64), t(f32), t(f32), t(f32), t(torch.int32), vocab,
                                     V=vocab, BLOCK=VOCAB_BLOCK, WITH_GRAD=True, num_warps=8,
                                     grid=grid))
-        print(f"[solution] background compile of 10 kernel variants took "
+        print(f"[solution] background compile of 11 kernel variants took "
               f"{time.perf_counter() - started:.1f} s", flush=True)
     except Exception as exc:  # noqa: BLE001 - a failed warm-up only means compiling at first use
         print(f"[solution] background compile skipped: {exc!r}", flush=True)

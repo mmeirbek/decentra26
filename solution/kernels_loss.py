@@ -100,7 +100,8 @@ class FusedLMLoss(torch.autograd.Function):
         token_loss = torch.empty(n_tokens, dtype=torch.float32, device=hidden.device)
         entropy = torch.empty_like(token_loss)
         hit = torch.empty(n_tokens, dtype=torch.int32, device=hidden.device)
-        grad_hidden = torch.empty_like(hidden) if with_grad else None
+        grad_hidden = torch.empty((-(-n_tokens // 128) * 128, hidden.shape[1]), dtype=hidden.dtype,
+                                  device=hidden.device)[:n_tokens] if with_grad else None
         gscale = (loss_scale / denominator).to(torch.float32)
         logits = torch.empty((min(CHUNK, n_tokens), vocab), dtype=hidden.dtype, device=hidden.device)
         for start in range(0, n_tokens, CHUNK):

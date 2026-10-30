@@ -17,7 +17,7 @@ import triton
 from .kernels_attn import qkv_rope_bwd_kernel, qkv_rope_fwd_kernel
 from .kernels_mlp import gated_act_kernel
 from .kernels_nf4 import NF4Group, dequant_group
-from .kernels_norm import add_rmsnorm_bwd_kernel, add_rmsnorm_fwd_kernel
+from .kernels_norm import add_rmsnorm_bwd_kernel, add_rmsnorm_fwd_kernel, lora_inputs_kernel
 
 ACT_BLOCK_FWD, ACT_BLOCK_BWD, ACT_WARPS = 1024, 512, 8  # fastest on a T4
 HALF = torch.float16
@@ -112,6 +112,18 @@ class StepState:
         self.unit = torch.ones(1, dtype=torch.float32, device=dev)
 
 
+ROW_BUCKET = 128
+
+
+def _rows(tokens, *dims, dtype=HALF, device):
+    """An uninitialized (tokens, *dims) tensor, viewed out of one with rows rounded up to
+    ROW_BUCKET. Batches have different token counts; without rounding, every step frees and asks
+    for slightly different sizes and the allocator's reserve grows past what is in use (521 MiB on
+    the T4). With it, the same few sizes come back and are reused."""
+    capacity = -(-tokens // ROW_BUCKET) * ROW_BUCKET
+    return torch.empty((capacity, *dims), dtype=dtype, device=device)[:tokens]
+
+
 class Normed:
     """What one residual add + RMSNorm produces: the new residual h (fp32, for the next block), x
     (fp16, for the matmul), and for backward xhat (fp16) and 1/rms; with LoRA inputs also xq and xv
@@ -124,16 +136,17 @@ class Normed:
 def _norm_launch(res, delta, weight, eps, step, keep_q=None, keep_v=None, drop_scale=None):
     tokens, hidden = res.shape
     dev = res.device
-    h = torch.empty_like(res)
-    rstd = torch.empty(tokens, dtype=torch.float32, device=dev)
-    x = torch.empty((tokens, hidden), dtype=HALF, device=dev)
-    xhat = torch.empty_like(x)
+    h = _rows(tokens, hidden, dtype=torch.float32, device=dev)
+    rstd = _rows(tokens, dtype=torch.float32, device=dev)
+    x = _rows(tokens, hidden, device=dev)
+    xhat = _rows(tokens, hidden, device=dev)
     with_lora = keep_q is not None
-    xq = torch.empty_like(x) if with_lora else x
-    xv = torch.empty_like(x) if with_lora else x
-    bits_q = torch.empty((tokens, hidden // 8), dtype=torch.uint8, device=dev) if with_lora \
+    xq = _rows(tokens, hidden, device=dev) if with_lora else x
+    xv = _rows(tokens, hidden, device=dev) if with_lora else x
+    bits_q = _rows(tokens, hidden // 8, dtype=torch.uint8, device=dev) if with_lora \
         else step.no_bits
-    bits_v = torch.empty_like(bits_q) if with_lora else step.no_bits
+    bits_v = _rows(tokens, hidden // 8, dtype=torch.uint8, device=dev) if with_lora \
+        else step.no_bits
     add_rmsnorm_fwd_kernel[(tokens,)](
         res, delta, weight, h, rstd, x, xhat, step.rowmap,
         keep_q if with_lora else step.no_keep, keep_v if with_lora else step.no_keep,
@@ -145,8 +158,8 @@ def _norm_launch(res, delta, weight, eps, step, keep_q=None, keep_v=None, drop_s
 def _norm_backward(dx, xhat, rstd, weight, dres_out, step, bits_q=None, bits_v=None,
                    drop_scale=None, dxq=None, dxv=None):
     tokens, hidden = xhat.shape
-    dres = torch.empty((tokens, hidden), dtype=torch.float32, device=xhat.device)
-    ddelta = torch.empty((tokens, hidden), dtype=HALF, device=xhat.device)
+    dres = _rows(tokens, hidden, dtype=torch.float32, device=xhat.device)
+    ddelta = _rows(tokens, hidden, device=xhat.device)
     with_lora = bits_q is not None
     add_rmsnorm_bwd_kernel[(tokens,)](
         dx, xhat, rstd, weight, dres_out, dres, ddelta,
@@ -154,12 +167,6 @@ def _norm_backward(dx, xhat, rstd, weight, dres_out, step, bits_q=None, bits_v=N
         drop_scale if with_lora else step.unit, dxq if with_lora else dx, dxv if with_lora else dx,
         H=hidden, BLOCK=triton.next_power_of_2(hidden), WITH_LORA=with_lora, num_warps=8)
     return dres, ddelta
-
-
-def _unpack_bits(bits, hidden):
-    """(tokens, hidden // 8) uint8 -> (tokens, hidden) bool, entry 8 * j + b from bit b of byte j."""
-    shifts = torch.arange(8, dtype=torch.uint8, device=bits.device)
-    return ((bits.unsqueeze(-1) >> shifts) & 1).view(bits.shape[0], hidden).bool()
 
 
 def _no_autocast(tensor):
@@ -191,18 +198,18 @@ class AttnPrologue(torch.autograd.Function):
         n = _norm_launch(res, delta, plan.ln_in.weight, plan.ln_in.variance_epsilon, step, keep_q,
                          keep_v, drop_scale)
         xq, xv = n.xq, n.xv
+        tokens = res.shape[0]
         w = dequant_group(plan.qkv, step.workspace)
-        qkv = torch.addmm(plan.qkv_bias, n.x, w.t())
+        qkv = torch.addmm(plan.qkv_bias, n.x, w.t(), out=_rows(tokens, w.shape[0], device=dev))
         del w
         aq16, bq16, av16, bv16 = (t.to(HALF) for t in (aq, bq, av, bv))
         lora_aq = xq @ aq16.t()
-        lora_q = lora_aq @ bq16.t()
+        lora_q = torch.mm(lora_aq, bq16.t(), out=_rows(tokens, bq16.shape[0], device=dev))
         lora_av = xv @ av16.t()
-        lora_v = lora_av @ bv16.t()
-        tokens = res.shape[0]
-        q = torch.empty((tokens, plan.n_heads, plan.head_dim), dtype=HALF, device=dev)
-        k = torch.empty((tokens, plan.n_kv, plan.head_dim), dtype=HALF, device=dev)
-        v = torch.empty_like(k)
+        lora_v = torch.mm(lora_av, bv16.t(), out=_rows(tokens, bv16.shape[0], device=dev))
+        q = _rows(tokens, plan.n_heads, plan.head_dim, device=dev)
+        k = _rows(tokens, plan.n_kv, plan.head_dim, device=dev)
+        v = _rows(tokens, plan.n_kv, plan.head_dim, device=dev)
         qkv_rope_fwd_kernel[(tokens, plan.n_heads + 2 * plan.n_kv)](
             qkv, lora_q, lora_v, step.cos, step.sin, step.rowmap, q, k, v,
             plan.lora_q.scaling, plan.lora_v.scaling, step.seq_len,
@@ -223,28 +230,28 @@ class AttnPrologue(torch.autograd.Function):
         dk = _zeros_if_none(dk, xhat, (tokens, plan.n_kv, plan.head_dim), HALF)
         dv = _zeros_if_none(dv, xhat, (tokens, plan.n_kv, plan.head_dim), HALF)
         width = (plan.n_heads + 2 * plan.n_kv) * plan.head_dim
-        dqkv = torch.empty((tokens, width), dtype=HALF, device=dev)
-        dlora_q = torch.empty((tokens, plan.n_heads * plan.head_dim), dtype=HALF, device=dev)
-        dlora_v = torch.empty((tokens, plan.n_kv * plan.head_dim), dtype=HALF, device=dev)
+        dqkv = _rows(tokens, width, device=dev)
+        dlora_q = _rows(tokens, plan.n_heads * plan.head_dim, device=dev)
+        dlora_v = _rows(tokens, plan.n_kv * plan.head_dim, device=dev)
         qkv_rope_bwd_kernel[(tokens, plan.n_heads + 2 * plan.n_kv)](
             dq, dk, dv, step.cos, step.sin,
             step.rowmap, dqkv, dlora_q, dlora_v, plan.lora_q.scaling, plan.lora_v.scaling,
             step.seq_len, NQ=plan.n_heads, NKV=plan.n_kv, D=plan.head_dim, num_warps=1)
         w = dequant_group(plan.qkv, step.workspace)
-        dx = dqkv @ w
+        dx = torch.mm(dqkv, w, out=_rows(tokens, hidden, device=dev))
         del w, dqkv
-        y = xhat.float() * plan.ln_in.weight  # the LoRA inputs, rebuilt as the forward made them
-        xq = torch.where(_unpack_bits(bits_q, hidden), y * drop_scale, 0.0).to(HALF)
-        xv = torch.where(_unpack_bits(bits_v, hidden), y * drop_scale, 0.0).to(HALF)
-        del y
+        xq = _rows(tokens, hidden, device=dev)  # the LoRA inputs, rebuilt as the forward made them
+        xv = _rows(tokens, hidden, device=dev)
+        lora_inputs_kernel[(tokens,)](xhat, plan.ln_in.weight, bits_q, bits_v, drop_scale, xq, xv,
+                                      H=hidden, BLOCK=triton.next_power_of_2(hidden), num_warps=8)
         d_bq = (dlora_q.t() @ lora_aq).float()
         d_lora_aq = dlora_q @ bq16
         d_aq = (d_lora_aq.t() @ xq).float()
-        dxq = d_lora_aq @ aq16
+        dxq = torch.mm(d_lora_aq, aq16, out=_rows(tokens, hidden, device=dev))
         d_bv = (dlora_v.t() @ lora_av).float()
         d_lora_av = dlora_v @ bv16
         d_av = (d_lora_av.t() @ xv).float()
-        dxv = d_lora_av @ av16
+        dxv = torch.mm(d_lora_av, av16, out=_rows(tokens, hidden, device=dev))
         dres = ddelta = None
         if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
             dres, ddelta = _norm_backward(
@@ -266,19 +273,20 @@ class PostBlock(torch.autograd.Function):
     @staticmethod
     def _forward(ctx, res, attn, plan, step):
         dev = res.device
+        tokens, hidden = res.shape
         w = dequant_group(plan.o, step.workspace)
-        o = attn @ w.t()
+        o = torch.mm(attn, w.t(), out=_rows(tokens, hidden, device=dev))
         del w
         n = _norm_launch(res, o, plan.ln_post.weight, plan.ln_post.variance_epsilon, step)
         del o
         w = dequant_group(plan.gate_up, step.workspace)
-        gu = n.x @ w.t()
+        gu = torch.mm(n.x, w.t(), out=_rows(tokens, 2 * plan.inter, device=dev))
         del w
-        act = torch.empty((res.shape[0], plan.inter), dtype=HALF, device=dev)
+        act = _rows(tokens, plan.inter, device=dev)
         gated_act_kernel[(res.shape[0], triton.cdiv(plan.inter, ACT_BLOCK_FWD))](
             gu, act, I=plan.inter, BLOCK=ACT_BLOCK_FWD, BACKWARD=False, num_warps=ACT_WARPS)
         w = dequant_group(plan.down, step.workspace)
-        out = act @ w.t()
+        out = torch.mm(act, w.t(), out=_rows(tokens, hidden, device=dev))
         del w, act
         if plan.recompute_mlp:
             ctx.save_for_backward(n.xhat, n.rstd)
@@ -296,13 +304,14 @@ class PostBlock(torch.autograd.Function):
         tokens, hidden = xhat.shape
         dout = _zeros_if_none(dout, xhat, (tokens, hidden), HALF)
         w = dequant_group(plan.down, step.workspace)
-        dact = dout @ w
+        dact = torch.mm(dout, w, out=_rows(tokens, plan.inter, device=dev))
         del w
         w_gu = None
         if plan.recompute_mlp:  # gate|up again from the MLP input, rebuilt from xhat as in forward
             w_gu = dequant_group(plan.gate_up, step.workspace)
-            x = (xhat.float() * plan.ln_post.weight).to(HALF)
-            gu = x @ w_gu.t()
+            x = _rows(tokens, hidden, device=dev)
+            torch.mul(xhat, plan.ln_post.weight, out=x)  # fp32 product, rounded to fp16 as before
+            gu = torch.mm(x, w_gu.t(), out=_rows(tokens, 2 * plan.inter, device=dev))
             del x
         else:
             gu = kept
@@ -311,13 +320,13 @@ class PostBlock(torch.autograd.Function):
         del dact
         if w_gu is None:
             w_gu = dequant_group(plan.gate_up, step.workspace)
-        dx = gu @ w_gu
+        dx = torch.mm(gu, w_gu, out=_rows(tokens, hidden, device=dev))
         del w_gu, gu
         dres, do = _norm_backward(dx, xhat, rstd, plan.ln_post.weight,
                                   _zeros_if_none(dh, xhat, (tokens, hidden), torch.float32), step)
         del dx
         w = dequant_group(plan.o, step.workspace)
-        dattn = do @ w
+        dattn = torch.mm(do, w, out=_rows(tokens, hidden, device=dev))
         del w, do
         return dres, dattn, None, None
 

@@ -23,7 +23,8 @@ from solution.blocks import ACT_BLOCK_BWD, ACT_BLOCK_FWD, ACT_WARPS  # noqa: E40
 from solution.kernels_attn import qkv_rope_bwd_kernel, qkv_rope_fwd_kernel  # noqa: E402
 from solution.kernels_mlp import gated_act_kernel  # noqa: E402
 from solution.kernels_nf4 import NF4Group  # noqa: E402
-from solution.kernels_norm import add_rmsnorm_bwd_kernel, add_rmsnorm_fwd_kernel  # noqa: E402
+from solution.kernels_norm import (add_rmsnorm_bwd_kernel, add_rmsnorm_fwd_kernel,  # noqa: E402
+                                   lora_inputs_kernel)
 
 
 def close(a, b, tol):
@@ -263,3 +264,22 @@ def test_packed_causal_attention_matches_sdpa_per_row():
     close(out, ref, 2e-3)
     for mine, theirs in zip(got, (q.grad, k.grad, v.grad)):
         close(mine, theirs, 5e-3)
+
+
+def test_lora_inputs_are_rebuilt_from_xhat_and_mask_bits():
+    torch.manual_seed(8)
+    tokens, hidden = 11, 1536
+    xhat = torch.randn(tokens, hidden, device=DEV).half()
+    w = torch.rand(hidden, device=DEV) + 0.5
+    keep_q = torch.rand(tokens, hidden, device=DEV) > 0.05
+    keep_v = torch.rand(tokens, hidden, device=DEV) > 0.05
+    weights = 2 ** torch.arange(8, device=DEV)
+    pack = lambda k: (k.view(tokens, hidden // 8, 8).long() * weights).sum(-1).to(torch.uint8)
+    scale = torch.tensor([1.0 / 0.95], device=DEV)
+    xq = torch.empty(tokens, hidden, dtype=torch.float16, device=DEV)
+    xv = torch.empty_like(xq)
+    lora_inputs_kernel[(tokens,)](xhat, w, pack(keep_q), pack(keep_v), scale, xq, xv, H=hidden,
+                                  BLOCK=2048, num_warps=8)
+    y = w * xhat.float()
+    assert torch.equal(xq, torch.where(keep_q, y * scale, 0.0).half())
+    assert torch.equal(xv, torch.where(keep_v, y * scale, 0.0).half())
