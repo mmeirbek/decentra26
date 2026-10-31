@@ -12,7 +12,7 @@
 ![Проверки](https://img.shields.io/badge/%D0%BF%D1%80%D0%BE%D0%B2%D0%B5%D1%80%D0%BA%D0%B8-10%2F10-2EA44F)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
-[Публичный ноутбук Kaggle](https://www.kaggle.com/code/mmeirbek/soup-kernel-challenge-decentra26) · [Финальный коммит](https://github.com/BAITC-Hacks/hack-2ab274f7-angels/commit/c3225300bc765fcc9f40478c6a4862ba64351969) ·
+[Публичный ноутбук Kaggle, версия 4](https://www.kaggle.com/code/mmeirbek/soup-kernel-challenge-decentra26?scriptVersionId=364184757) · [Финальный коммит](https://github.com/BAITC-Hacks/hack-2ab274f7-angels/commit/c3225300bc765fcc9f40478c6a4862ba64351969) ·
 [Публичное зеркало](https://github.com/mmeirbek/decentra26) · [SUBMISSION.md](SUBMISSION.md)
 
 </div>
@@ -28,7 +28,7 @@
 | Пик памяти GPU (nvidia-smi), МиБ | 14 345 | 1 061 | **m = 13,520** |
 | Eval loss на открытых строках | 2,04960 | 2,04964 | +0,002 % |
 
-Ноутбук Kaggle — https://www.kaggle.com/code/mmeirbek/soup-kernel-challenge-decentra26 (версия 4, `COMMIT` = финальный коммит
+Ноутбук Kaggle — https://www.kaggle.com/code/mmeirbek/soup-kernel-challenge-decentra26?scriptVersionId=364184757 (версия 4, `COMMIT` = финальный коммит
 [c322530](https://github.com/BAITC-Hacks/hack-2ab274f7-angels/commit/c3225300bc765fcc9f40478c6a4862ba64351969); после него менялись только README.md и SUBMISSION.md). Ноутбук
 клонирует [публичное зеркало](https://github.com/mmeirbek/decentra26) этого репозитория с той же историей и теми же хешами.
 
@@ -106,7 +106,10 @@ transformers 5.16.1, peft 0.20.0, trl 0.29.1, bitsandbytes 0.50.2, accelerate 1.
 
 Шина PCIe на Kaggle T4 даёт 12,3 ГБ/с к GPU и 13,1 ГБ/с обратно, и копирование идёт на своих
 движках рядом со счётом: 680 МБ рядом с циклом умножений не меняют его время (наш замер). Поэтому на
-GPU остаются только слой, который считается, и следующий:
+GPU остаются только слой, который считается, и следующий. Правила стартового набора прямо разрешают
+такое: «Allowed: … recomputation or offloading in your own code (its time counts)». Встроенный режим
+Soup `activation_offloading` (его ТЗ запрещает переключать) не включается: выгрузку делает наш код,
+и её время входит в замер.
 
 - **4-битные коды всех слоёв (625 МиБ) — в закреплённой памяти CPU уже с загрузки.** Каждая
   проекция переезжает туда сразу после квантизации (`Bnb4bitQuantize.convert` transformers);
@@ -147,7 +150,9 @@ GPU остаются только слой, который считается, �
   получает её копию.
 - `datasets` для каждого `map` хеширует функцию через dill ради имени кеш-файла (~2 с); у набора в
   памяти кеш-файлов нет, и ему даётся случайный отпечаток — так `datasets` делает сам, когда хеш не
-  считается. Генератор у `datasets` свой, глобальный ГСЧ не сдвигается.
+  считается. Генератор у `datasets` свой, глобальный ГСЧ не сдвигается. Сам пакет `datasets` мы не
+  ставим: он приходит с `soup-cli[train]`, и Soup строит на нём набор данных; патч меняет только имя
+  кеша, которого у набора в памяти нет, — данные, порядок и токены те же (проверка 5).
 - bitsandbytes для каждого из 196 весов заново строит таблицу NF4 на GPU из списка Python с
   ожиданием GPU (~0,9 с); таблица строится один раз, каждый вес получает свою копию.
 
@@ -195,7 +200,7 @@ transformers (коды в память CPU при загрузке), а такж
 (File → Import Notebook), включить GPU T4 x2 и Internet, в первой ячейке указать
 `REPO_URL = "https://github.com/mmeirbek/decentra26.git"` (публичное зеркало; для репозитория команды на платформе нужен секрет
 `GITHUB_TOKEN`) и `COMMIT = "c3225300bc765fcc9f40478c6a4862ba64351969"`, нажать Run All (~10 минут). Сохранённая версия с
-результатами: https://www.kaggle.com/code/mmeirbek/soup-kernel-challenge-decentra26.
+результатами (версия 4): https://www.kaggle.com/code/mmeirbek/soup-kernel-challenge-decentra26?scriptVersionId=364184757.
 
 **Локально на Linux с CUDA:**
 

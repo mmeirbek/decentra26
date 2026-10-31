@@ -5,7 +5,7 @@
   (after it only README.md and SUBMISSION.md changed; public mirror with the same history and
   hashes, which the Kaggle notebook clones: https://github.com/mmeirbek/decentra26)
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
-  our README): https://www.kaggle.com/code/mmeirbek/soup-kernel-challenge-decentra26 (version 4)
+  our README): https://www.kaggle.com/code/mmeirbek/soup-kernel-challenge-decentra26?scriptVersionId=364184757 (version 4)
 - Demo video (up to 3 minutes): VIDEO_LINK
 - Presentation: SLIDES_LINK
 
