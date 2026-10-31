@@ -327,5 +327,5 @@ Trainer/Soup, которые обходят все 933 модуля модели
 - **Капитан:** Нурдаулет Мейрбек — GitHub [mmeirbek](https://github.com/mmeirbek), Telegram
   [@mmeirbek](https://t.me/mmeirbek). Кернелы, выгрузка в CPU, замеры, README.
 
-Видео и презентация — в [папке Google Drive](https://drive.google.com/drive/folders/1pr8es_StRZTiHbMatobY_ha1orPD0qFi). Лицензия — Apache-2.0 (`LICENSE`, `NOTICE`),
-как у стартового набора.
+Видео и презентация — в [папке Google Drive](https://drive.google.com/drive/folders/1pr8es_StRZTiHbMatobY_ha1orPD0qFi).
+Лицензия — Apache-2.0 (`LICENSE`, `NOTICE`), как у стартового набора.

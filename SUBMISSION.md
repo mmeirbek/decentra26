@@ -13,6 +13,7 @@
 | Name | Role | GitHub | Kaggle | Contact (captain) |
 |---|---|---|---|---|
 | Нурдаулет Мейрбек (Nurdaulet Meirbek) | captain; kernels, offload, measurements, write-up | [mmeirbek](https://github.com/mmeirbek) | [mmeirbek](https://www.kaggle.com/mmeirbek) | Telegram [@mmeirbek](https://t.me/mmeirbek) |
+
 ## Our kernels
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4, public notebook) |
 |---|---|---|---|
