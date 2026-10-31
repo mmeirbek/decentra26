@@ -290,6 +290,20 @@ def test_a_projection_takes_its_codes_back_before_its_own_forward():
     assert all(m.weight.data.is_cuda for m in _linear4bit(peft_model))
 
 
+@pytest.mark.skipif(DEV != "cuda", reason="a conversion on the GPU")
+def test_bf16_checkpoint_tensors_convert_on_the_gpu_to_the_same_bits(monkeypatch):
+    from solution import offload
+
+    monkeypatch.setattr(offload, "CAST_CHUNK", 1 << 16)  # the chunked path too
+    torch.manual_seed(3)
+    for shape in [(7,), (64, 48), (3000, 40)]:
+        x = (torch.randn(shape) * torch.logspace(-9, 5, shape[-1])).to(torch.bfloat16)
+        ref = x.to(device=DEV, dtype=torch.float16)  # converted on the CPU, as transformers does
+        out = offload.cast_on_gpu(x, torch.device(DEV), torch.float16)
+        assert out.dtype == torch.float16 and out.shape == ref.shape
+        assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+
+
 def test_row_segments():
     rowmap = torch.tensor([0, 1, 2, 5, 6, 10])  # seq_len 5: rows 0 (0-2), 1 (0-1), 2 (0)
     assert row_segments(rowmap, 5) == [(0, 3), (3, 5), (5, 6)]

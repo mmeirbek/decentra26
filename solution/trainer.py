@@ -109,6 +109,20 @@ def patch_kbit_preparation():
     _patch(peft, "prepare_model_for_kbit_training", make)
 
 
+def _last_step_unlocks_host_memory():
+    from transformers import TrainerCallback
+
+    from .offload import unlock_host_memory
+
+    class Unlock(TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.max_steps and state.global_step >= state.max_steps:
+                torch.cuda.synchronize()  # the last step's copies are done
+                unlock_host_memory()
+
+    return Unlock()
+
+
 def patch_soup_wrapper():
     from soup_cli.trainer.sft import SFTTrainerWrapper
 
@@ -127,6 +141,9 @@ def patch_soup_wrapper():
             plan = plan_of(getattr(self, "model", None))
             if plan is None:
                 return original(self, *args, **kwargs)
+            trainer = getattr(self, "trainer", None)
+            if plan.host is not None and hasattr(trainer, "add_callback"):
+                trainer.add_callback(_last_step_unlocks_host_memory())
             plan.activate()
             try:
                 return original(self, *args, **kwargs)

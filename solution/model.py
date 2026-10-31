@@ -172,6 +172,9 @@ def install_plan(peft_model, recompute_mlp=None, require_cuda=True):
     causal_lm = get_base() if callable(get_base) else peft_model
     if not isinstance(causal_lm, Qwen2ForCausalLM):
         return None
+    from . import offload
+
+    offload._loading["cast_on_gpu"] = False  # the checkpoint has loaded
     host = causal_lm.__dict__.pop("_soupk_host", None)
     recompute = RECOMPUTE_MLP if recompute_mlp is None else recompute_mlp
     try:

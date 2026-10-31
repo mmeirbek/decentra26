@@ -43,7 +43,39 @@ def _aligned(n):
 
 
 def _pinned(nbytes):
+    """`nbytes` of page-locked host memory. Registered with cudaHostRegister at their exact size:
+    PyTorch's pinned allocator rounds every block up to a power of two (4.35 GB pinned for our
+    3.5 GiB), and each pinned byte costs time to lock and again to unlock when the process ends
+    (on Kaggle 3.5 GiB: 1.9 s and 0.65 s that way, 1.5 s and 0.26 s registered)."""
+    buf = torch.empty(nbytes + 4096, dtype=torch.uint8)
+    view = buf[(-buf.data_ptr()) % 4096:][:nbytes]  # page-aligned; the view keeps buf alive
+    try:
+        cudart = torch.cuda.cudart()
+        if cudart.cudaHostRegister(view.data_ptr(), nbytes, 0) == cudart.cudaError.success \
+                and view.is_pinned():
+            _registered.append(view.data_ptr())
+            return view
+    except Exception:  # noqa: BLE001 - PyTorch's pinned allocator instead
+        pass
     return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+
+
+_registered = []  # host addresses this process registered
+
+
+def unlock_host_memory():
+    """After the last training step: unlock the registered host memory in a background thread,
+    while Soup saves the checkpoint and the adapter, instead of when the process ends (the
+    memory stays valid, only pageable again: nothing copies from it asynchronously any more)."""
+    def unlock(addresses):
+        cudart = torch.cuda.cudart()
+        for address in addresses:
+            cudart.cudaHostUnregister(address)
+
+    addresses, _registered[:] = list(_registered), []
+    if addresses:
+        threading.Thread(target=unlock, args=(addresses,), name="solution-unpin",
+                         daemon=True).start()
 
 
 class HostWeights:
@@ -247,12 +279,62 @@ def skip_allocator_warmup():
 
     def caching_allocator_warmup(model, expanded_device_map, hf_quantizer, *args, **kwargs):
         if wants_host_weights(model, hf_quantizer):
+            from .startup import cache_nf4_table
+
+            _loading["cast_on_gpu"] = True  # this load's tensors convert on the GPU
+            cache_nf4_table()  # bitsandbytes is imported by now
             return None
         return original(model, expanded_device_map, hf_quantizer, *args, **kwargs)
 
     caching_allocator_warmup._soupk = True
     caching_allocator_warmup.__wrapped__ = original
     modeling_utils.caching_allocator_warmup = caching_allocator_warmup
+
+
+_loading = {"cast_on_gpu": False}
+CAST_CHUNK = 32 << 20
+
+
+def patch_materialize():
+    """transformers loads each checkpoint tensor with `tensor.to(device=cuda, dtype=float16)`; for
+    the bf16 checkpoint PyTorch converts on the CPU first (its rule for copies between CPU and
+    GPU), 1.8 s of the load on Kaggle's CPU. For the model this path takes, each tensor goes to the
+    GPU as stored and converts there, 0.8 s, in pieces of at most 32 MB so the 467 MB embedding
+    needs no second copy beside it. Same rounding: all 1,543,714,304 values of the task's
+    checkpoint come out bit for bit the same (our probe; only a NaN's payload bits could differ)."""
+    try:
+        from transformers import core_model_loading as loading
+    except Exception:  # noqa: BLE001 - nothing to patch
+        return
+    original = getattr(loading, "_materialize_copy", None)
+    if original is None or getattr(original, "_soupk", False):
+        return
+
+    def _materialize_copy(tensor, device=None, dtype=None):
+        if not _loading["cast_on_gpu"] or device is None or dtype is None:
+            return original(tensor, device, dtype)
+        target = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+        tensor = tensor[...]  # what loads it from the safetensors slice
+        if target.type != "cuda" or tensor.device.type != "cpu" or tensor.dtype == dtype \
+                or not tensor.is_floating_point() or not dtype.is_floating_point:
+            return original(tensor, device, dtype)
+        return cast_on_gpu(tensor, target, dtype)
+
+    _materialize_copy._soupk = True
+    _materialize_copy.__wrapped__ = original
+    loading._materialize_copy = _materialize_copy
+
+
+def cast_on_gpu(tensor, device, dtype):
+    """`tensor.to(device=device, dtype=dtype)`, converted on the GPU, in pieces of rows."""
+    row_bytes = tensor[0].numel() * tensor.element_size() if tensor.dim() else 0
+    if tensor.dim() == 0 or tensor.numel() * tensor.element_size() <= CAST_CHUNK:
+        return tensor.to(device).to(dtype)
+    rows = max(1, CAST_CHUNK // row_bytes)
+    out = torch.empty(tensor.shape, dtype=dtype, device=device)
+    for start in range(0, tensor.shape[0], rows):
+        out[start:start + rows].copy_(tensor[start:start + rows].to(device))
+    return out
 
 
 def layer_and_projection(name, n_layers):
