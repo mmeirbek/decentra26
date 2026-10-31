@@ -12,7 +12,7 @@
 ## Team (up to 4 people)
 | Name | Role | GitHub | Kaggle | Contact (captain) |
 |---|---|---|---|---|
-| CAPTAIN_NAME | kernels, offload, measurements, write-up | mmeirbek | mmeirbek | CAPTAIN_CONTACT |
+| Нурдаулет Мейрбек (Nurdaulet Meirbek) | captain; kernels, offload, measurements, write-up | [mmeirbek](https://github.com/mmeirbek) | [mmeirbek](https://www.kaggle.com/mmeirbek) | Telegram [@mmeirbek](https://t.me/mmeirbek) |
 | TEAMMATE_NAME | a parallel solution: weight streaming and activation offload, setup-time patches | TEAMMATE_GITHUB | TEAMMATE_KAGGLE | |
 
 ## Our kernels

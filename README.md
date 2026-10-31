@@ -321,5 +321,10 @@ Trainer/Soup, которые обходят все 933 модуля модели
 
 ## Команда
 
-Команда **Angels**, Decentrathon 6.0, кейс Soup Kernel Challenge. Состав, роли и контакты — в
-[SUBMISSION.md](SUBMISSION.md). Лицензия — Apache-2.0 (`LICENSE`, `NOTICE`), как у стартового набора.
+Команда **Angels**, Decentrathon 6.0, кейс Soup Kernel Challenge.
+
+- **Капитан:** Нурдаулет Мейрбек — GitHub [mmeirbek](https://github.com/mmeirbek), Telegram
+  [@mmeirbek](https://t.me/mmeirbek). Кернелы, выгрузка в CPU, замеры, README.
+
+Полный состав и роли — в [SUBMISSION.md](SUBMISSION.md). Лицензия — Apache-2.0 (`LICENSE`, `NOTICE`),
+как у стартового набора.
