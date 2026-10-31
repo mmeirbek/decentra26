@@ -13,7 +13,8 @@
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
 [Публичный ноутбук Kaggle, версия 4](https://www.kaggle.com/code/mmeirbek/soup-kernel-challenge-decentra26?scriptVersionId=364184757) · [Финальный коммит](https://github.com/BAITC-Hacks/hack-2ab274f7-angels/commit/c3225300bc765fcc9f40478c6a4862ba64351969) ·
-[Публичное зеркало](https://github.com/mmeirbek/decentra26) · [SUBMISSION.md](SUBMISSION.md)
+[Публичное зеркало](https://github.com/mmeirbek/decentra26) · [Видео и презентация](https://drive.google.com/drive/folders/1pr8es_StRZTiHbMatobY_ha1orPD0qFi) ·
+[SUBMISSION.md](SUBMISSION.md)
 
 </div>
 
@@ -326,5 +327,5 @@ Trainer/Soup, которые обходят все 933 модуля модели
 - **Капитан:** Нурдаулет Мейрбек — GitHub [mmeirbek](https://github.com/mmeirbek), Telegram
   [@mmeirbek](https://t.me/mmeirbek). Кернелы, выгрузка в CPU, замеры, README.
 
-Полный состав и роли — в [SUBMISSION.md](SUBMISSION.md). Лицензия — Apache-2.0 (`LICENSE`, `NOTICE`),
+Видео и презентация — в [папке Google Drive](https://drive.google.com/drive/folders/1pr8es_StRZTiHbMatobY_ha1orPD0qFi). Лицензия — Apache-2.0 (`LICENSE`, `NOTICE`),
 как у стартового набора.

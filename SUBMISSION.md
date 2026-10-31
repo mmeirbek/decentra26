@@ -6,15 +6,13 @@
   hashes, which the Kaggle notebook clones: https://github.com/mmeirbek/decentra26)
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
   our README): https://www.kaggle.com/code/mmeirbek/soup-kernel-challenge-decentra26?scriptVersionId=364184757 (version 4)
-- Demo video (up to 3 minutes): VIDEO_LINK
-- Presentation: SLIDES_LINK
+- Demo video (up to 3 minutes) and presentation, one Google Drive folder:
+  https://drive.google.com/drive/folders/1pr8es_StRZTiHbMatobY_ha1orPD0qFi
 
 ## Team (up to 4 people)
 | Name | Role | GitHub | Kaggle | Contact (captain) |
 |---|---|---|---|---|
 | Нурдаулет Мейрбек (Nurdaulet Meirbek) | captain; kernels, offload, measurements, write-up | [mmeirbek](https://github.com/mmeirbek) | [mmeirbek](https://www.kaggle.com/mmeirbek) | Telegram [@mmeirbek](https://t.me/mmeirbek) |
-| TEAMMATE_NAME | a parallel solution: weight streaming and activation offload, setup-time patches | TEAMMATE_GITHUB | TEAMMATE_KAGGLE | |
-
 ## Our kernels
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4, public notebook) |
 |---|---|---|---|
