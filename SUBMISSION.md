@@ -1,10 +1,10 @@
 # Submission: TEAM_NAME
 
 ## Links
-- Repository, final commit: https://github.com/mmeirbek/decentra26/commit/8e791e9d8aa827c3fbf6423cc347ae0debc25aed
+- Repository, final commit: https://github.com/mmeirbek/decentra26/commit/fb4683d406eeddf7d012e1a97056559e6b6961c7
   (after it only README.md and SUBMISSION.md changed)
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
-  our README): https://www.kaggle.com/code/mmeirbek/soup-kernel-challenge-decentra26 (version 2)
+  our README): https://www.kaggle.com/code/mmeirbek/soup-kernel-challenge-decentra26 (version 3)
 - Demo video (up to 3 minutes): VIDEO_LINK
 - Presentation: SLIDES_LINK
 
@@ -17,21 +17,21 @@
 ## Our kernels
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4, public notebook) |
 |---|---|---|---|
-| `nf4_dequant_kernel` | `solution/kernels_nf4.py` | bitsandbytes `dequantize_blockwise` + `dequantize_4bit` (NF4 with nested scales), one launch per q\|k\|v and gate\|up group | 7.70% |
-| `gated_act_kernel` | `solution/kernels_mlp.py` | fp32 gate / up, SiLU and product, and their backward (in place on the gate\|up buffer) | 3.14% |
-| `add_rmsnorm_fwd_kernel` | `solution/kernels_norm.py` | residual add + `Qwen2RMSNorm` in fp32, LoRA dropout inputs, mask packing | 1.40% |
-| `add_rmsnorm_bwd_kernel` | `solution/kernels_norm.py` | backward of the above, with the LoRA input gradients | 1.16% |
-| `lm_loss_kernel` | `solution/kernels_loss.py` | `ForCausalLMLoss`, fp32 logit copies, TRL entropy / accuracy, Soup's per-row losses | 1.05% |
-| `qkv_rope_fwd_kernel` | `solution/kernels_attn.py` | peft clone + LoRA add, casts, RoPE via slice / neg / cat | 0.51% |
-| `qkv_rope_bwd_kernel` | `solution/kernels_attn.py` | backward of the above | 0.41% |
-| `lora_inputs_kernel` | `solution/kernels_norm.py` | the stored LoRA dropout inputs (rebuilt in backward from `xhat` and mask bits) | 0.27% |
-| **all** | | | **15.6%** (limit 5%) |
+| `nf4_dequant_kernel` | `solution/kernels_nf4.py` | bitsandbytes `dequantize_blockwise` + `dequantize_4bit` (NF4 with nested scales), one launch per q\|k\|v and gate\|up group | 8.57% |
+| `gated_act_kernel` | `solution/kernels_mlp.py` | fp32 gate / up, SiLU and product, and their backward (in place on the gate\|up buffer) | 3.64% |
+| `add_rmsnorm_fwd_kernel` | `solution/kernels_norm.py` | residual add + `Qwen2RMSNorm` in fp32, LoRA dropout inputs, mask packing | 1.64% |
+| `add_rmsnorm_bwd_kernel` | `solution/kernels_norm.py` | backward of the above, with the LoRA input gradients | 1.36% |
+| `lm_loss_kernel` | `solution/kernels_loss.py` | `ForCausalLMLoss`, fp32 logit copies, TRL entropy / accuracy, Soup's per-row losses | 1.01% |
+| `qkv_rope_fwd_kernel` | `solution/kernels_attn.py` | peft clone + LoRA add, casts, RoPE via slice / neg / cat | 0.55% |
+| `qkv_rope_bwd_kernel` | `solution/kernels_attn.py` | backward of the above | 0.42% |
+| `lora_inputs_kernel` | `solution/kernels_norm.py` | the stored LoRA dropout inputs (rebuilt in backward from `xhat` and mask bits) | 0.31% |
+| **all** | | | **17.5%** (limit 5%) |
 
 Around the kernels (not kernels; solution/offload.py, solution/startup.py): the 4-bit codes of every
 layer and what each layer keeps for its backward live in pinned host memory and stream over PCIe on
 side streams next to the compute (two GPU slots for the codes, the kept tensors one layer ahead);
 setup work outside training is cut (TRL's package map, in-memory `datasets.map` fingerprints,
-bitsandbytes' NF4 table). Nothing of it changes a value.
+bitsandbytes' NF4 table, the bf16 checkpoint converted to fp16 on the GPU, not the CPU). Nothing of it changes a value.
 
 Ideas taken from other kernels, with links (we wrote the code ourselves):
 - Fused large-vocabulary loss without full logits: Liger Kernel `FusedLinearCrossEntropy`
@@ -54,10 +54,13 @@ Ideas taken from other kernels, with links (we wrote the code ourselves):
 ## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json` of the notebook above)
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | 91.8 | 51.8 | speedup 1.772x |
-| of it the 64 training steps, s | 59.0 | 29.8 | 1.98x |
+| Time of `soup train`, s | 88.7 | 45.9 | speedup 1.930x |
+| of it the 64 training steps, s | 55.7 | 25.6 | 2.17x |
 | Peak GPU memory, MiB | 14 345 | 1 061 | base/ours 13.520x |
-| Eval loss (public rows) | 2.04964 | 2.04967 | +0.001% vs base |
+| Eval loss (public rows) | 2.04966 | 2.04963 | -0.001% vs base |
+
+The time depends on the Kaggle machine: the base took 88.7 s in this run and 79-82 s in our A/B runs on
+one machine, where the speedup is 1.68-1.72x (ours 46.4-47.9 s).
 
 - [x] All 10 checks of `harness/check_rules.py` passed
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits
@@ -70,7 +73,7 @@ padding, elementwise traffic, NF4 dequantization), how each kernel works, result
 ## Limitations
 - The fused path is written for this case: Qwen2, NF4 with nested scales, fp16 on a T4, LoRA on
   q_proj and v_proj, SDPA. Anything else runs Soup's own path unchanged.
-- About 22 s of the 52 s are outside the training loop; ~16 s of that run before
+- About 20 s of the 46 s are outside the training loop; ~16 s of that run before
   `apply()` (Python, torch, CUDA, transformers: the harness's own, shared with the base).
 - Matmuls stay on cuBLAS (~73% of the GPU time, ~29 TFLOPS); NF4 dequantization is a separate
   kernel at the T4's memory bandwidth. A fused Triton "dequant + matmul" for Turing is the next
