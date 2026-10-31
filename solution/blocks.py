@@ -9,6 +9,10 @@ Kept for backward per token and layer: each norm's normalized input (fp16) and 1
 inputs (as the base keeps them) and their dropout masks as bits, what SDPA keeps, and the fp16
 gate|up buffer (or only the MLP input when `recompute_mlp` is on). Weights are dequantized from NF4 into
 a temporary right before each matmul, in forward and again in backward, as bitsandbytes does.
+
+On the T4 path the NF4 codes and the kept tensors live in pinned host memory (offload.py): each
+layer enters the weight stream before its first dequant and leaves it after its last, and its
+kept tensors go through the activation stash (`_keep` / `_kept`).
 """
 
 import torch
@@ -17,6 +21,7 @@ import triton
 from .kernels_attn import qkv_rope_bwd_kernel, qkv_rope_fwd_kernel
 from .kernels_mlp import gated_act_kernel
 from .kernels_nf4 import NF4Group, dequant_group
+from .offload import PROJECTIONS
 from .kernels_norm import add_rmsnorm_bwd_kernel, add_rmsnorm_fwd_kernel, lora_inputs_kernel
 from . import warmup
 
@@ -51,8 +56,10 @@ class LoraSide:
 class LayerPlan:
     """What the fused path of one decoder layer reads, looked up once before training."""
 
-    def __init__(self, layer, recompute_mlp):
+    def __init__(self, layer, recompute_mlp, host=None, index=0):
         attn, mlp = layer.self_attn, layer.mlp
+        self.index = index
+        q_, k_, v_, o_, gate_, up_, down_ = PROJECTIONS
         if getattr(attn, "attention_dropout", 0.0) or getattr(attn, "sliding_window", None):
             raise ValueError("attention dropout and sliding windows are not supported")
         for name in ("k_proj", "o_proj"):
@@ -67,15 +74,19 @@ class LayerPlan:
         if self.lora_q.dropout != self.lora_v.dropout:
             raise ValueError("q_proj and v_proj LoRA dropout differ")
         q, k, v = (_base_layer(m) for m in (attn.q_proj, attn.k_proj, attn.v_proj))
-        self.qkv = NF4Group([m.weight for m in (q, k, v)], share=True)
+        self.qkv = NF4Group([m.weight for m in (q, k, v)], share=True, host=host, layer=index,
+                            names=(q_, k_, v_))
         biases = [m.bias for m in (q, k, v)]
         if any(b is None for b in biases):
             raise ValueError("Qwen2 q/k/v projections carry a bias")
         self.qkv_bias = torch.cat([b.detach().to(HALF) for b in biases])
-        self.o = NF4Group([_base_layer(attn.o_proj).weight])
+        self.o = NF4Group([_base_layer(attn.o_proj).weight], host=host, layer=index,
+                          names=(o_,))
         self.gate_up = NF4Group([_base_layer(mlp.gate_proj).weight,
-                                 _base_layer(mlp.up_proj).weight], share=True)
-        self.down = NF4Group([_base_layer(mlp.down_proj).weight])
+                                 _base_layer(mlp.up_proj).weight], share=True, host=host,
+                                layer=index, names=(gate_, up_))
+        self.down = NF4Group([_base_layer(mlp.down_proj).weight], host=host, layer=index,
+                             names=(down_,))
         for group in (self.qkv, self.o, self.gate_up, self.down):
             if group.dtype != HALF:
                 raise ValueError("needs fp16 compute (the T4 path)")
@@ -96,9 +107,12 @@ class LayerPlan:
 class StepState:
     """Per-forward facts shared by every layer."""
 
-    def __init__(self, rowmap, batch, seq_len, cos, sin, segments, workspace=None):
+    def __init__(self, rowmap, batch, seq_len, cos, sin, segments, workspace=None, weights=None,
+                 stash=None):
         dev = rowmap.device
         self.workspace = workspace  # fp16 buffer every weight dequant of the step writes
+        self.weights = weights  # offload.WeightStream when the NF4 codes live on the host
+        self.stash = stash  # offload.ActivationStash when the kept tensors go to the host
         self.cu_seqlens = self.max_seqlen = None
         if segments is not None:  # each row's [start, stop) in packed order, for varlen attention
             bounds = [0] + [stop for _, stop in segments]
@@ -171,6 +185,38 @@ def _norm_backward(dx, xhat, rstd, weight, dres_out, step, bits_q=None, bits_v=N
     return dres, ddelta
 
 
+def _weight(plan, group, step):
+    """The group's dense fp16 weight in the step's workspace, from the GPU slot of its layer
+    when the codes are streamed."""
+    words = None
+    if step.weights is not None and group.words_start is not None:
+        words = step.weights.words(plan.index, group.words_start, group.n_words)
+    return dequant_group(group, step.workspace, words)
+
+
+def _enter(plan, step, ahead):
+    if step.weights is not None:
+        step.weights.enter(plan.index, ahead)
+
+
+def _leave(plan, step):
+    if step.weights is not None:
+        step.weights.leave(plan.index)
+
+
+def _keep(ctx, step, index, *tensors):
+    """save_for_backward, or the activation stash when it is on."""
+    if step.stash is None:
+        ctx.save_for_backward(*tensors)
+        ctx.held = None
+    else:
+        ctx.held = step.stash.push(index, tensors)
+
+
+def _kept(ctx, step):
+    return ctx.saved_tensors if ctx.held is None else step.stash.get(ctx.held)
+
+
 def _no_autocast(tensor):
     """Our matmuls already get the fp16 operands autocast would make; keep autocast out of them
     (and out of the `out=` matmuls it does not handle)."""
@@ -197,11 +243,12 @@ class AttnPrologue(torch.autograd.Function):
     @staticmethod
     def _forward(ctx, res, delta, keep_q, keep_v, drop_scale, aq, bq, av, bv, plan, step):
         dev = res.device
+        _enter(plan, step, plan.index + 1)
         n = _norm_launch(res, delta, plan.ln_in.weight, plan.ln_in.variance_epsilon, step, keep_q,
                          keep_v, drop_scale)
         xq, xv = n.xq, n.xv
         tokens = res.shape[0]
-        w = dequant_group(plan.qkv, step.workspace)
+        w = _weight(plan, plan.qkv, step)
         qkv = torch.addmm(plan.qkv_bias, n.x, w.t(), out=_rows(tokens, w.shape[0], device=dev))
         del w
         aq16, bq16, av16, bv16 = (t.to(HALF) for t in (aq, bq, av, bv))
@@ -216,16 +263,16 @@ class AttnPrologue(torch.autograd.Function):
             qkv, lora_q, lora_v, step.cos, step.sin, step.rowmap, q, k, v,
             plan.lora_q.scaling, plan.lora_v.scaling, step.seq_len,
             NQ=plan.n_heads, NKV=plan.n_kv, D=plan.head_dim, num_warps=1)
-        ctx.save_for_backward(n.xhat, n.rstd, lora_aq, lora_av, n.bits_q, n.bits_v, drop_scale,
-                              aq16, bq16, av16, bv16)
+        _keep(ctx, step, plan.index, n.xhat, n.rstd, lora_aq, lora_av, n.bits_q, n.bits_v,
+              drop_scale, aq16, bq16, av16, bv16)
         ctx.plan, ctx.step = plan, step
         return n.h, q, k, v
 
     @staticmethod
     def backward(ctx, dh, dq, dk, dv):
-        xhat, rstd, lora_aq, lora_av, bits_q, bits_v, drop_scale, aq16, bq16, av16, bv16 = \
-            ctx.saved_tensors
         plan, step = ctx.plan, ctx.step
+        xhat, rstd, lora_aq, lora_av, bits_q, bits_v, drop_scale, aq16, bq16, av16, bv16 = \
+            _kept(ctx, step)
         tokens, hidden = xhat.shape
         dev = xhat.device
         dq = _zeros_if_none(dq, xhat, (tokens, plan.n_heads, plan.head_dim), HALF)
@@ -239,7 +286,8 @@ class AttnPrologue(torch.autograd.Function):
             dq, dk, dv, step.cos, step.sin,
             step.rowmap, dqkv, dlora_q, dlora_v, plan.lora_q.scaling, plan.lora_v.scaling,
             step.seq_len, NQ=plan.n_heads, NKV=plan.n_kv, D=plan.head_dim, num_warps=1)
-        w = dequant_group(plan.qkv, step.workspace)
+        w = _weight(plan, plan.qkv, step)
+        _leave(plan, step)
         dx = torch.mm(dqkv, w, out=_rows(tokens, hidden, device=dev))
         del w, dqkv
         xq = _rows(tokens, hidden, device=dev)  # the LoRA inputs, rebuilt as the forward made them
@@ -276,41 +324,45 @@ class PostBlock(torch.autograd.Function):
     def _forward(ctx, res, attn, plan, step):
         dev = res.device
         tokens, hidden = res.shape
-        w = dequant_group(plan.o, step.workspace)
+        w = _weight(plan, plan.o, step)
         o = torch.mm(attn, w.t(), out=_rows(tokens, hidden, device=dev))
         del w
         n = _norm_launch(res, o, plan.ln_post.weight, plan.ln_post.variance_epsilon, step)
         del o
-        w = dequant_group(plan.gate_up, step.workspace)
+        w = _weight(plan, plan.gate_up, step)
         gu = torch.mm(n.x, w.t(), out=_rows(tokens, 2 * plan.inter, device=dev))
         del w
         act = _rows(tokens, plan.inter, device=dev)
         gated_act_kernel[(res.shape[0], triton.cdiv(plan.inter, ACT_BLOCK))](
             gu, act, 0, I=plan.inter, BLOCK=ACT_BLOCK, num_warps=ACT_WARPS)
-        w = dequant_group(plan.down, step.workspace)
+        w = _weight(plan, plan.down, step)
+        _leave(plan, step)
         out = torch.mm(act, w.t(), out=_rows(tokens, hidden, device=dev))
         del w, act
         if plan.recompute_mlp:
-            ctx.save_for_backward(n.xhat, n.rstd)
+            _keep(ctx, step, plan.index, n.xhat, n.rstd)
         else:
-            ctx.save_for_backward(n.xhat, n.rstd, gu)
+            _keep(ctx, step, plan.index, n.xhat, n.rstd, gu)
         ctx.plan, ctx.step = plan, step
         return n.h, out
 
     @staticmethod
     def backward(ctx, dh, dout):
-        xhat, rstd, *kept = ctx.saved_tensors
-        kept = kept[0] if kept else None
         plan, step = ctx.plan, ctx.step
+        _enter(plan, step, plan.index - 1)
+        xhat, rstd, *kept = _kept(ctx, step)
+        if step.stash is not None:
+            step.stash.prefetch(plan.index - 1)
+        kept = kept[0] if kept else None
         dev = xhat.device
         tokens, hidden = xhat.shape
         dout = _zeros_if_none(dout, xhat, (tokens, hidden), HALF)
-        w = dequant_group(plan.down, step.workspace)
+        w = _weight(plan, plan.down, step)
         dact = torch.mm(dout, w, out=_rows(tokens, plan.inter, device=dev))
         del w
         w_gu = None
         if plan.recompute_mlp:  # gate|up again from the MLP input, rebuilt from xhat as in forward
-            w_gu = dequant_group(plan.gate_up, step.workspace)
+            w_gu = _weight(plan, plan.gate_up, step)
             x = _rows(tokens, hidden, device=dev)
             torch.mul(xhat, plan.ln_post.weight, out=x)  # fp32 product, rounded to fp16 as before
             gu = torch.mm(x, w_gu.t(), out=_rows(tokens, 2 * plan.inter, device=dev))
@@ -321,13 +373,13 @@ class PostBlock(torch.autograd.Function):
             gu, dact, 1, I=plan.inter, BLOCK=ACT_BLOCK, num_warps=ACT_WARPS)
         del dact
         if w_gu is None:
-            w_gu = dequant_group(plan.gate_up, step.workspace)
+            w_gu = _weight(plan, plan.gate_up, step)
         dx = torch.mm(gu, w_gu, out=_rows(tokens, hidden, device=dev))
         del w_gu, gu
         dres, do = _norm_backward(dx, xhat, rstd, plan.ln_post.weight,
                                   _zeros_if_none(dh, xhat, (tokens, hidden), torch.float32), step)
         del dx
-        w = dequant_group(plan.o, step.workspace)
+        w = _weight(plan, plan.o, step)
         dattn = torch.mm(do, w, out=_rows(tokens, hidden, device=dev))
         del w, do
         return dres, dattn, None, None
@@ -343,7 +395,7 @@ def attend(lp, q, k, v, step, attention_fn, mask):
     tokens = q.shape[0]
     if step.segments is not None and q.is_cuda:
         out = PackedCausalAttention.apply(q, k, v, step.cu_seqlens, step.max_seqlen,
-                                          lp.attn.scaling)
+                                          lp.attn.scaling, lp.index, step)
         return out.view(tokens, -1)
     if step.segments is not None:
         outs = []
@@ -378,19 +430,24 @@ class PackedCausalAttention(torch.autograd.Function):
     per 1,000 tokens than SDPA, which keeps the repeated ones."""
 
     @staticmethod
-    def forward(ctx, q, k, v, cu_seqlens, max_seqlen, scale):
+    def forward(ctx, q, k, v, cu_seqlens, max_seqlen, scale, index=0, step=None):
         groups = q.shape[1] // k.shape[1]
         out, lse, seed, offset, _, _ = torch.ops.aten._efficient_attention_forward(
             q.unsqueeze(0), _repeat_heads(k, groups).unsqueeze(0),
             _repeat_heads(v, groups).unsqueeze(0), None, cu_seqlens, cu_seqlens, max_seqlen,
             max_seqlen, 0.0, 1, True, scale=scale)  # 1: causal from the top left of each row
-        ctx.save_for_backward(q, k, v, out, lse, seed, offset, cu_seqlens)
-        ctx.max_seqlen, ctx.scale, ctx.groups = max_seqlen, scale, groups
+        if step is None or step.stash is None:
+            ctx.save_for_backward(q, k, v, out, lse, seed, offset, cu_seqlens)
+            ctx.held = None
+        else:
+            ctx.held = step.stash.push(index, (q, k, v, out, lse, seed, offset, cu_seqlens))
+        ctx.max_seqlen, ctx.scale, ctx.groups, ctx.step = max_seqlen, scale, groups, step
         return out.squeeze(0)
 
     @staticmethod
     def backward(ctx, dout):
-        q, k, v, out, lse, seed, offset, cu_seqlens = ctx.saved_tensors
+        q, k, v, out, lse, seed, offset, cu_seqlens = ctx.saved_tensors if ctx.held is None \
+            else ctx.step.stash.get(ctx.held)
         groups, kv_heads = ctx.groups, k.shape[1]
         dq, dk, dv, _ = torch.ops.aten._efficient_attention_backward(
             dout.unsqueeze(0).contiguous(), q.unsqueeze(0), _repeat_heads(k, groups).unsqueeze(0),
@@ -399,7 +456,7 @@ class PackedCausalAttention(torch.autograd.Function):
         tokens, dim = q.shape[0], q.shape[2]
         dk = dk.view(tokens, kv_heads, groups, dim).sum(2)  # as repeat_kv's backward sums
         dv = dv.view(tokens, kv_heads, groups, dim).sum(2)
-        return dq.squeeze(0), dk, dv, None, None, None
+        return dq.squeeze(0), dk, dv, None, None, None, None, None
 
 
 def _repeat_heads(x, groups):

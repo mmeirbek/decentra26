@@ -1,10 +1,10 @@
 """Compile our Triton kernels while Soup loads the model.
 
 Every measured run starts with empty compiler caches, so each kernel variant costs a compile (one to
-a few seconds on Kaggle's CPU) before its first launch. `from_pretrained` builds the Qwen2 module
-from its config first and then spends most of its time reading and quantizing the weights, so the
-compiles start in a background thread of this same process as soon as the module exists, with the
-sizes from that config (model.patch_qwen2 calls `start`). Each compiled kernel is also made ready to
+a few seconds on Kaggle's CPU) before its first launch. The compiles start in a background thread of
+this same process as soon as `apply()` runs, with the sizes of the task's model
+(Qwen2.5-1.5B-Instruct), and overlap the imports, Soup's setup and the model load; a model of other
+sizes compiles its own variants at their first launch instead. Each compiled kernel is also made ready to
 launch there: Triton builds a small C launcher for it and loads the binary on its first launch,
 about 0.3 s per kernel on Kaggle that would otherwise fall into the first training step. The
 kernels compile in the order of their first use: the first fused forward waits for the forward
@@ -14,15 +14,20 @@ ones only, the first backward for the rest. Nothing here launches a kernel on th
 
 import threading
 import time
+import types
 
 import torch
+
+QWEN25_15B = types.SimpleNamespace(model_type="qwen2", hidden_size=1536, intermediate_size=8960,
+                                   num_attention_heads=12, num_key_value_heads=2, head_dim=128,
+                                   vocab_size=151936, num_hidden_layers=28)
 
 _thread = None
 _forward_ready = threading.Event()  # set once the kernels the forward pass launches are ready
 _waited = {"forward": False, "backward": False}
 
 
-def start(config):
+def start(config=QWEN25_15B):
     """Start compiling for a Qwen2 config, once per process, when a GPU is there."""
     global _thread
     if _thread is not None or not torch.cuda.is_available():

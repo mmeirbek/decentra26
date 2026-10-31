@@ -203,6 +203,93 @@ def test_kbit_preparation_keeps_the_tied_embedding_as_loaded():
     assert weight.dtype == torch.float32 and torch.equal(weight, widened)
 
 
+def _codes_on_host(peft_model, after_peft_too=False):
+    """What offload.patch_bnb_loading leaves after loading: every projection's codes but q_proj
+    and v_proj in pinned host blocks."""
+    from solution import offload
+
+    lm = peft_model.get_base_model()
+    host = offload.HostWeights(lm.config, offload.stash_bytes_per_token(lm.config, gate_up=True))
+    host.wait()
+    for i, layer in enumerate(lm.model.layers):
+        for name in offload.PROJECTIONS:
+            if after_peft_too or name not in offload.AFTER_PEFT:
+                module = layer.get_submodule(name)
+                assert host.place(getattr(module, "base_layer", module), i, name)
+    lm.__dict__["_soupk_host"] = host
+    return host
+
+
+def _linear4bit(peft_model):
+    import bitsandbytes as bnb
+
+    return [m for m in peft_model.modules() if isinstance(m, bnb.nn.Linear4bit)]
+
+
+@pytest.mark.skipif(DEV != "cuda", reason="pinned host memory and CUDA streams")
+@pytest.mark.parametrize("recompute_mlp", [False, True])
+def test_streamed_codes_and_stashed_tensors_give_the_same_steps_bit_for_bit(monkeypatch,
+                                                                            recompute_mlp):
+    from solution import offload
+
+    patch_qwen2()
+    monkeypatch.setattr(offload, "SMALL", 0)  # the tiny model's tensors all go to the host too
+    ids, mask, labels = batch()
+    results = []
+    for streamed in (False, True):
+        peft_model = tiny_qlora_model(lora_dropout=0.05)
+        if streamed:
+            _codes_on_host(peft_model)
+        plan = install_plan(peft_model, recompute_mlp=recompute_mlp)
+        assert (plan.host is not None) == streamed
+        if streamed:  # q_proj and v_proj joined the others; nothing of the codes on the GPU
+            assert all(m.weight.data.device.type == "cpu" and m.weight.data.is_pinned()
+                       for m in _linear4bit(peft_model))
+        plan.activate()
+        torch.manual_seed(11)
+        losses, token_losses = [], []
+        for _ in range(3):  # later steps reuse the slots and the arenas
+            peft_model.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=DEV, dtype=torch.float16):
+                out = peft_model(input_ids=ids, attention_mask=mask, labels=labels,
+                                 use_cache=False)
+            out.loss.backward()
+            losses.append(out.loss.detach())
+            token_losses.append(plan.last_step.token_loss.clone())
+        grads = {n: p.grad.clone() for n, p in peft_model.named_parameters()
+                 if p.grad is not None}
+        plan.deactivate()
+        results.append((losses, token_losses, grads))
+    (l0, t0, g0), (l1, t1, g1) = results
+    assert all(torch.equal(a, b) for a, b in zip(l0, l1))
+    assert all(torch.equal(a, b) for a, b in zip(t0, t1))
+    assert g0.keys() == g1.keys() and len(g0) == 8
+    assert all(torch.equal(g0[name], g1[name]) for name in g0)
+
+
+@pytest.mark.skipif(DEV != "cuda", reason="pinned host memory")
+def test_codes_go_back_to_the_gpu_when_soups_own_path_trains():
+    peft_model = tiny_qlora_model()
+    _codes_on_host(peft_model)
+    peft_model.get_base_model().config.hidden_act = "gelu"  # a model the fused path does not take
+    assert install_plan(peft_model) is None
+    assert all(m.weight.data.is_cuda for m in _linear4bit(peft_model))
+    assert all(p.is_cuda for p in peft_model.parameters())
+
+
+@pytest.mark.skipif(DEV != "cuda", reason="pinned host memory")
+def test_a_projection_takes_its_codes_back_before_its_own_forward():
+    peft_model = tiny_qlora_model()
+    ids, mask, labels = batch()
+    with torch.no_grad():
+        ref = peft_model(input_ids=ids, attention_mask=mask, use_cache=False).logits
+    _codes_on_host(peft_model, after_peft_too=True)
+    with torch.no_grad():
+        out = peft_model(input_ids=ids, attention_mask=mask, use_cache=False).logits
+    assert torch.equal(out, ref)
+    assert all(m.weight.data.is_cuda for m in _linear4bit(peft_model))
+
+
 def test_row_segments():
     rowmap = torch.tensor([0, 1, 2, 5, 6, 10])  # seq_len 5: rows 0 (0-2), 1 (0-1), 2 (0)
     assert row_segments(rowmap, 5) == [(0, 3), (3, 5), (5, 6)]

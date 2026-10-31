@@ -61,9 +61,13 @@ class NF4Group:
 
     With `share=True` the packed codes and the 8-bit scales of the group are moved into one
     buffer each and every Params4bit (and its quant state) is pointed at its slice of them:
-    the same values, no second copy, and bitsandbytes reads them as before."""
+    the same values, no second copy, and bitsandbytes reads them as before.
 
-    def __init__(self, params, share=False):
+    With `host` (offload.HostWeights, codes of `layer` placed back to back in its block) the codes
+    stay on the host: `words_start` / `n_words` locate them in the layer's block, and each
+    dequant reads them from the GPU slot the caller passes (offload.WeightStream)."""
+
+    def __init__(self, params, share=False, host=None, layer=0, names=()):
         states = [_check(p) for p in params]
         cols = states[0].shape[1]
         if any(qs.shape[1] != cols or qs.dtype != states[0].dtype for qs in states):
@@ -71,7 +75,7 @@ class NF4Group:
         if any(not torch.equal(qs.code, states[0].code)
                or not torch.equal(qs.state2.code, states[0].state2.code) for qs in states[1:]):
             raise ValueError("a group needs one NF4 table and one scale code book")
-        dev = params[0].data.device
+        dev = states[0].absmax.device  # the scales stay on the GPU when the codes do not
         self.shape = (sum(qs.shape[0] for qs in states), cols)
         self.numel = self.shape[0] * cols
         self.dtype = states[0].dtype
@@ -79,13 +83,25 @@ class NF4Group:
         words = [p.data.view(-1).view(torch.int32) for p in params]
         scale_q = [qs.absmax for qs in states]
         scale2 = [qs.state2.absmax for qs in states]
+        self.words_start = self.n_words = None
+        if host is not None:
+            starts = [host.offsets[name][0] for name in names]
+            if any(not host.is_placed(p, layer, name) for p, name in zip(params, names)) or any(
+                    a + p.data.numel() != b for a, b, p in zip(starts, starts[1:], params)):
+                raise ValueError("the group's codes are not back to back in the host block")
+            self.words_start, self.n_words = starts[0] // 4, sum(w.numel() for w in words)
         if len(params) == 1:
             self.words, self.scale_q, self.scale2 = words[0], scale_q[0], scale2[0]
         elif share:
-            (self.words, words), (self.scale_q, scale_q), (self.scale2, scale2) = (
-                self._share(parts) for parts in (words, scale_q, scale2))
-            for p, qs, wv, sq, s2 in zip(params, states, words, scale_q, scale2):
-                p.data = wv.view(torch.uint8).view(p.data.shape)
+            (self.scale_q, shared_q), (self.scale2, shared_2) = (
+                self._share(parts) for parts in (scale_q, scale2))
+            if host is None:
+                self.words, shared_words = self._share(words)
+                for p, wv in zip(params, shared_words):
+                    p.data = wv.view(torch.uint8).view(p.data.shape)
+            else:  # the codes already sit back to back in the host block
+                self.words = None
+            for qs, sq, s2 in zip(states, shared_q, shared_2):
                 qs.absmax, qs.state2.absmax = sq, s2
         else:  # a copy for the kernel next to bitsandbytes' own tensors (tests)
             self.words, self.scale_q, self.scale2 = (torch.cat(parts)
@@ -119,22 +135,26 @@ class NF4Group:
             at += t.numel()
         return whole, views
 
-    def dequant(self, out=None):
-        """The weights as one dense (sum of out_features, in_features) tensor in compute dtype."""
+    def dequant(self, out=None, words=None):
+        """The weights as one dense (sum of out_features, in_features) tensor in compute dtype;
+        `words`: the group's codes on the GPU when they live on the host."""
+        words = self.words if words is None else words
+        if words is None or not words.is_cuda and self.scale_q.is_cuda:
+            raise RuntimeError("the codes of this group are on the host: pass their GPU copy")
         if out is None:
-            out = torch.empty(self.shape, dtype=self.dtype, device=self.words.device)
+            out = torch.empty(self.shape, dtype=self.dtype, device=self.scale_q.device)
         nf4_dequant_kernel[(self.programs,)](
-            self.words, self.scale_q, self.scale2, self.scale_code, self.nf4, out,
+            words, self.scale_q, self.scale2, self.scale_code, self.nf4, out,
             self.prog_weight, self.word_start, self.scale_q_start, self.scale2_start, self.offset,
             BLOCK=WORDS_PER_PROGRAM, num_warps=NF4_WARPS, enable_fp_fusion=False)
         return out
 
 
-def dequant_group(group, workspace=None):
+def dequant_group(group, workspace=None, words=None):
     """`group.dequant()` into a view of `workspace` when given: every dequant of a step writes
     the same buffer, which the matmul reading it has finished with by then (one CUDA stream), so
     the allocator never sees these 5-55 MB temporaries."""
     if workspace is None:
-        return group.dequant()
+        return group.dequant(words=words)
     rows, cols = group.shape
-    return group.dequant(workspace[:rows * cols].view(rows, cols))
+    return group.dequant(workspace[:rows * cols].view(rows, cols), words)

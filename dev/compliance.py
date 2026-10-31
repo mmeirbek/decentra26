@@ -41,8 +41,11 @@ def source_checks():
                 imports |= {a.name.split(".")[0] for a in node.names}
             elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
                 imports.add(node.module.split(".")[0])
+    # the TZ's packages, the standard library we use, and datasets: installed with
+    # soup-cli[train] and used by Soup itself; startup.py patches its map fingerprint only
     allowed = {"torch", "triton", "transformers", "peft", "trl", "bitsandbytes", "soup_cli",
-               "threading", "time", "os", "pytest", "types", "solution"}
+               "threading", "time", "os", "sys", "importlib", "pytest", "types", "solution",
+               "datasets"}
     ok &= line(not (imports & set(BANNED_MODULES)), "no banned kernel library imported",
                ", ".join(sorted(imports & set(BANNED_MODULES))) or "none")
     ok &= line(imports <= allowed, "only allowed packages imported", ", ".join(sorted(imports)))

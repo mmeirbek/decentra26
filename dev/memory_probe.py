@@ -24,7 +24,7 @@ def _where(frames):
 
 def report(tag):
     snap = torch.cuda.memory._snapshot()
-    sizes, counts = defaultdict(int), defaultdict(int)
+    sizes, counts, example = defaultdict(int), defaultdict(int), {}
     for seg in snap["segments"]:
         for block in seg["blocks"]:
             if block["state"] != "active_allocated":
@@ -33,12 +33,23 @@ def report(tag):
             key = _where(frames)
             sizes[key] += block["size"]
             counts[key] += 1
+            if block["size"] > example.get(key, (0, None))[0]:
+                example[key] = (block["size"], frames)
     total = sum(sizes.values())
     print(f"[memprobe] {tag}: allocated {torch.cuda.memory_allocated() / 2**20:.0f} MiB "
           f"(snapshot {total / 2**20:.0f} MiB), reserved {torch.cuda.memory_reserved() / 2**20:.0f} MiB,"
           f" peak allocated {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB", flush=True)
     for key, size in sorted(sizes.items(), key=lambda kv: -kv[1])[:30]:
         print(f"[memprobe]   {size / 2**20:8.1f} MiB  x{counts[key]:<5d} {key}", flush=True)
+    for key, size in sorted(sizes.items(), key=lambda kv: -kv[1])[:2]:
+        print(f"[memprobe]   stack of the largest block of {key}:", flush=True)
+        shown = 0
+        for frame in example[key][1] or []:
+            name = frame.get("filename", "")
+            if name.endswith(".py") and shown < 30:
+                shown += 1
+                print(f"[memprobe]       {name.split('-packages/')[-1]}:{frame.get('line')} "
+                      f"{frame.get('name')}", flush=True)
 
 
 def phase(tag):

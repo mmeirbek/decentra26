@@ -5,7 +5,9 @@ the case this path is written for (Qwen2, NF4 with nested scales, fp16 compute, 
 v_proj, SDPA) and attaches a `ModelPlan`. Anything else keeps Soup's own path. The plan is active
 only while Soup trains (trainer.py). The tied embedding / output head stays in fp16 as loaded
 (`fp16_embedding_to_keep`; its values came from an fp16 checkpoint, so nothing changes), and if
-peft widened it anyway, it is narrowed for training and restored afterwards.
+peft widened it anyway, it is narrowed for training and restored afterwards. When the 4-bit
+codes were moved to pinned host memory while loading (offload.patch_bnb_loading), q_proj and
+v_proj follow here, and the plan streams the codes and stashes what backward keeps (offload.py).
 
 `fused_forward` replaces Qwen2ForCausalLM.forward for training steps with labels:
   - pad positions are dropped right away (`rowmap` = flat indices of the real tokens); attention
@@ -22,10 +24,14 @@ import torch
 
 from .blocks import AttnPrologue, FinalNorm, LayerPlan, PostBlock, StepState, attend
 from .kernels_loss import IGNORE_INDEX, FusedLMLoss, labelled_first, loss_scale_of
+from .offload import PROJECTIONS, ActivationStash, WeightStream
 from . import warmup
 
-RECOMPUTE_MLP = True  # keep no MLP activations and redo gate|up in backward: on a T4 about -1.1 GB
-                      # at the peak for about 10-13% more time per step
+# True: keep no MLP activations and redo gate|up in backward (-1.1 GB at the peak for 10-13% more
+# time per step when everything stays on the GPU). With the kept tensors in host memory, gate|up
+# goes there too and costs no GPU memory, so it is kept: faster on a T4 than recomputing it in all
+# layers or in every other one (A/B on one machine).
+RECOMPUTE_MLP = False
 
 
 class TokenStats:
@@ -39,7 +45,7 @@ class TokenStats:
 
 
 class ModelPlan:
-    def __init__(self, causal_lm, recompute_mlp):
+    def __init__(self, causal_lm, recompute_mlp, host=None):
         from transformers.integrations.sdpa_attention import sdpa_attention_forward
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
@@ -56,8 +62,10 @@ class ModelPlan:
         self.attention = ALL_ATTENTION_FUNCTIONS.get_interface(config._attn_implementation,
                                                                sdpa_attention_forward)
         self.causal_lm = causal_lm
-        self.layers = [LayerPlan(layer, recompute_mlp)
-                       for layer in causal_lm.model.layers[:config.num_hidden_layers]]
+        self.host = host
+        self.layers = [LayerPlan(layer, recompute_mlp, host, i)
+                       for i, layer in enumerate(causal_lm.model.layers[:config.num_hidden_layers])]
+        self.weights = self.stash = None
         self.embed = embed
         self.norm = causal_lm.model.norm
         self.scaler = None
@@ -80,6 +88,9 @@ class ModelPlan:
         largest = max(group.numel for lp in self.layers
                       for group in (lp.qkv, lp.o, lp.gate_up, lp.down))
         self.workspace = torch.empty(largest, dtype=torch.float16, device=weight.device)
+        if self.host is not None:
+            self.weights = WeightStream(self.host, weight.device)
+            self.stash = ActivationStash(self.host, weight.device)
         self.active = True
 
     def deactivate(self):
@@ -87,7 +98,8 @@ class ModelPlan:
         if self.active:
             print(f"[solution] fused forward ran for {self.fused_steps} training steps", flush=True)
         self.active = False
-        self.workspace = None
+        self.workspace = self.weights = self.stash = None  # the codes stay on the host: frozen,
+        # not in the adapter, and a projection that runs its own forward takes them back first
         dtype = getattr(self, "_embed_dtype", None)
         if dtype is not None:
             self.embed.weight.data = self.embed.weight.data.to(dtype)
@@ -135,6 +147,20 @@ def _widen_kept_embedding(causal_lm):
         weight.data = weight.data.to(torch.float32)
 
 
+def _codes_to_host(causal_lm, host):
+    """Every projection's codes in the host block (q_proj and v_proj only now: peft has put
+    their LoRA on the GPU); False if any does not fit, so nothing is streamed."""
+    host.wait()
+    for i, layer in enumerate(causal_lm.model.layers[:host.n_layers]):
+        for name in PROJECTIONS:
+            module = layer.get_submodule(name)
+            module = getattr(module, "base_layer", module)
+            if not host.is_placed(module.weight, i, name) and not host.place(module, i, name):
+                return False
+    host.settle()
+    return True
+
+
 def install_plan(peft_model, recompute_mlp=None, require_cuda=True):
     """Attach the fused path to the Qwen2 inside `peft_model`; returns the plan, or None (with the
     reason printed) when the model is not the case it is written for."""
@@ -146,16 +172,31 @@ def install_plan(peft_model, recompute_mlp=None, require_cuda=True):
     causal_lm = get_base() if callable(get_base) else peft_model
     if not isinstance(causal_lm, Qwen2ForCausalLM):
         return None
+    host = causal_lm.__dict__.pop("_soupk_host", None)
+    recompute = RECOMPUTE_MLP if recompute_mlp is None else recompute_mlp
     try:
         if require_cuda and causal_lm.model.embed_tokens.weight.device.type != "cuda":
             raise ValueError("needs a CUDA device")
-        plan = ModelPlan(causal_lm, RECOMPUTE_MLP if recompute_mlp is None else recompute_mlp)
+        if host is not None and not _codes_to_host(causal_lm, host):
+            print("[solution] 4-bit codes stay on the GPU: the host blocks do not fit them",
+                  flush=True)
+            host.restore(causal_lm)
+            host = None
+        plan = ModelPlan(causal_lm, recompute, host)
     except (ValueError, AttributeError, KeyError) as exc:
         print(f"[solution] fused path off, Soup's own path runs: {exc}", flush=True)
+        if host is not None:
+            host.restore(causal_lm)
         _widen_kept_embedding(causal_lm)
         return None
     causal_lm.__dict__["_soupk_plan"] = plan
-    print(f"[solution] fused path on: {len(plan.layers)} layers, packed tokens, fused loss",
+    if host is not None and getattr(causal_lm, "hf_device_map", None) is None:
+        # transformers 5 records no device map, so accelerate.prepare_model calls model.to(device),
+        # which would copy every code back from the host. This is the map a model placed on one
+        # device carries (Soup's own layer streaming sets it for the same reason).
+        causal_lm.hf_device_map = {"": causal_lm.model.embed_tokens.weight.device.index}
+    where = ", 4-bit codes and kept tensors in pinned host memory" if host is not None else ""
+    print(f"[solution] fused path on: {len(plan.layers)} layers, packed tokens, fused loss{where}",
           flush=True)
     return plan
 
@@ -210,6 +251,11 @@ def fused_forward(model, plan, input_ids, attention_mask, labels, num_items_in_b
     from transformers.models.qwen2 import modeling_qwen2
 
     warmup.wait()
+    if plan.fused_steps == 0 and plan.host is not None:
+        moved = plan.host.reclaim()
+        if moved:
+            print(f"[solution] {moved} projections' codes had been copied back to the GPU; they "
+                  "are read from the host again", flush=True)
     plan.fused_steps += 1
     dev = input_ids.device
     batch, seq_len = input_ids.shape
@@ -234,7 +280,9 @@ def fused_forward(model, plan, input_ids, attention_mask, labels, num_items_in_b
                                                  attention_mask=attention_mask,
                                                  past_key_values=None, position_ids=position_ids)
     step = StepState(rowmap, batch, seq_len, cos[0].contiguous(), sin[0].contiguous(), segments,
-                     plan.workspace)
+                     plan.workspace, plan.weights, plan.stash)
+    if plan.stash is not None:
+        plan.stash.begin_step()
 
     delta = torch.zeros((tokens, hidden), dtype=torch.float16, device=dev)
     ones = plan.dropout_input((batch, seq_len, hidden), dev)
@@ -245,6 +293,8 @@ def fused_forward(model, plan, input_ids, attention_mask, labels, num_items_in_b
                                           lp.lora_q.b, lp.lora_v.a, lp.lora_v.b, lp, step)
         attn = attend(lp, q, k, v, step, plan.attention, mask)
         res, delta = PostBlock.apply(res, attn, lp, step)
+    if plan.stash is not None:
+        plan.stash.flush()
     x = FinalNorm.apply(res, delta, plan.norm, step)
 
     if num_items_in_batch is None:
@@ -288,12 +338,3 @@ def patch_qwen2():
     forward._soupk = True
     forward.__wrapped__ = original
     Qwen2ForCausalLM.forward = forward
-
-    original_init = Qwen2ForCausalLM.__init__
-
-    def __init__(self, config, *args, **kwargs):
-        original_init(self, config, *args, **kwargs)
-        warmup.start(config)  # weights load after this: compile while they do
-
-    __init__.__wrapped__ = original_init
-    Qwen2ForCausalLM.__init__ = __init__
